@@ -1,0 +1,89 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: jobs
+      POSTGRES_PASSWORD: jobs
+      POSTGRES_DB: jobs
+    ports:
+      - "5432:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobs -d jobs"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Separate database for the test suite. Tests need a real PostgreSQL (JSONB,
+  # partial unique indexes, and SKIP LOCKED in spec 10 have no SQLite
+  # equivalent), but must never touch development data. tmpfs: throwaway and fast.
+  db-test:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: jobs
+      POSTGRES_PASSWORD: jobs
+      POSTGRES_DB: jobs_test
+    ports:
+      - "5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jobs -d jobs_test"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Dispatch hint and worker liveness only — never the source of truth. The
+  # stack keeps processing jobs with this container stopped; see
+  # specs/07-redis-dispatch.md.
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://jobs:jobs@db:5432/jobs
+      REDIS_URL: redis://redis:6379/0
+      LOG_LEVEL: INFO
+    ports:
+      - "8000:8000"
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.api.app:create_app --factory --host 0.0.0.0 --port 8000"
+
+  worker:
+    build: .
+    depends_on:
+      api:
+        condition: service_started
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://jobs:jobs@db:5432/jobs
+      REDIS_URL: redis://redis:6379/0
+      WORKER_CONCURRENCY: 2
+      LOG_LEVEL: INFO
+    command: ["python", "-m", "app.worker"]
+    deploy:
+      replicas: 2
+    # Must exceed SHUTDOWN_GRACE_SECONDS, or Docker sends SIGKILL part-way
+    # through the wind-down and the in-flight leases are never released.
+    stop_grace_period: 40s
+
+volumes:
+  db-data:
