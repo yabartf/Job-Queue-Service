@@ -76,6 +76,24 @@ class JobListResponse(BaseModel):
     has_more: bool
 
 
+class JobLogEntry(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    level: str
+    message: str
+    #: Structured context for the event. Never carries payload contents — see
+    #: specs/10-job-history.md section 3 for the full set of keys and why.
+    meta: dict[str, Any]
+    created_at: datetime
+
+
+class JobLogListResponse(BaseModel):
+    items: list[JobLogEntry]
+    limit: int
+    offset: int
+    has_more: bool
+
+
 class QueueDepth(BaseModel):
     scheduled: int
     pending: int

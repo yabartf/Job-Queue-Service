@@ -180,6 +180,28 @@ class JobRepository:
     ) -> None:
         self.session.add(JobLog(job_id=job_id, level=level, message=message, meta=meta or {}))
 
+    async def list_logs(self, job_id: UUID, limit: int, offset: int) -> tuple[list[JobLog], bool]:
+        """A page of one job's history, oldest first, and whether more follows.
+
+        Ascending, unlike list_jobs: a single job's log is a timeline read start
+        to finish, not a feed. The ``id`` tie-break is load-bearing — rows written
+        in one transaction share a ``created_at`` from ``now()``, and only the
+        sequence separates them, so ordering on the timestamp alone would let a
+        claim and its failure come back in either order.
+
+        ``has_more`` is the same extra-row trick list_jobs uses, for the same
+        reason: no COUNT(*) over a set that grows with every retry.
+        """
+        stmt = (
+            select(JobLog)
+            .where(JobLog.job_id == job_id)
+            .order_by(JobLog.created_at.asc(), JobLog.id.asc())
+            .offset(offset)
+            .limit(limit + 1)
+        )
+        rows = list((await self.session.execute(stmt)).scalars().all())
+        return rows[:limit], len(rows) > limit
+
     async def commit(self) -> None:
         """Make the current unit of work durable.
 

@@ -6,7 +6,13 @@ from uuid import UUID
 from fastapi import APIRouter, Query, Response, status
 
 from app.api.deps import JobServiceDep
-from app.api.schemas import JobListResponse, JobResponse, SubmitJobRequest
+from app.api.schemas import (
+    JobListResponse,
+    JobLogEntry,
+    JobLogListResponse,
+    JobResponse,
+    SubmitJobRequest,
+)
 from app.core.config import get_settings
 from app.core.enums import JobStatus, JobType
 from app.db.repository import JobFilters
@@ -46,6 +52,30 @@ async def submit_job(
 @router.get("/{job_id}", response_model=JobResponse, summary="Get a job")
 async def get_job(job_id: UUID, service: JobServiceDep) -> JobResponse:
     return JobResponse.model_validate(await service.get(job_id))
+
+
+@router.get(
+    "/{job_id}/logs",
+    response_model=JobLogListResponse,
+    summary="Read a job's history",
+    responses={404: {"description": "No such job"}},
+)
+async def get_job_logs(
+    job_id: UUID,
+    service: JobServiceDep,
+    limit: Annotated[int, Query(ge=1, le=get_settings().max_page_size)] = (
+        get_settings().default_page_size
+    ),
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> JobLogListResponse:
+    # Oldest first: this is a timeline, not a feed. See specs/10-job-history.md.
+    logs, has_more = await service.get_logs(job_id, limit, offset)
+    return JobLogListResponse(
+        items=[JobLogEntry.model_validate(entry) for entry in logs],
+        limit=limit,
+        offset=offset,
+        has_more=has_more,
+    )
 
 
 @router.get("", response_model=JobListResponse, summary="List jobs")

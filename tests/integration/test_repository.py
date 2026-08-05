@@ -257,6 +257,34 @@ async def test_l2_19_job_logs_cascade_on_delete(repository, db_session):
     ).scalar_one() == 0
 
 
+async def test_l2_21_list_logs_reads_a_timeline_oldest_first(repository, db_session):
+    job = await add_job(db_session)
+    other = await add_job(db_session)
+    for index in range(3):
+        await repository.add_log(job.id, "info", f"event {index}", {"n": index})
+    await repository.add_log(other.id, "info", "someone else's event", {})
+    await db_session.flush()
+
+    page, has_more = await repository.list_logs(job.id, limit=2, offset=0)
+
+    # Ascending, and by the sequence rather than the timestamp: all four rows
+    # were written in one transaction and share a created_at from now().
+    assert [entry.message for entry in page] == ["event 0", "event 1"]
+    assert has_more is True
+
+    tail, has_more = await repository.list_logs(job.id, limit=2, offset=2)
+
+    assert [entry.message for entry in tail] == ["event 2"]
+    assert has_more is False
+
+
+async def test_list_logs_of_a_job_with_no_history_is_empty(repository, db_session):
+    job = await add_job(db_session)
+    await db_session.flush()
+
+    assert await repository.list_logs(job.id, limit=20, offset=0) == ([], False)
+
+
 async def test_count_by_status_reports_every_status(repository, db_session):
     await add_job(db_session, status=JobStatus.PENDING)
     await add_job(db_session, status=JobStatus.PENDING)

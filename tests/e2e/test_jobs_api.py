@@ -1,8 +1,8 @@
-"""E2E-01 .. E2E-23, E2E-26, E2E-27 — the HTTP contract."""
+"""E2E-01 .. E2E-37 — the HTTP contract."""
 
 import asyncio
 from datetime import UTC, datetime, timedelta
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -420,6 +420,84 @@ async def test_e2e_33_the_dead_letter_queue_is_listable(client, db_session):
 
     assert [item["id"] for item in listed] == [str(poison.id)]
     assert listed[0]["dead_letter_reason"] == "worker_crash_loop"
+
+
+# --------------------------------------------------------------------------
+# Job history — specs/10-job-history.md
+# --------------------------------------------------------------------------
+
+
+async def test_e2e_34_a_jobs_history_is_readable_oldest_first(client, db_session, repository):
+    job_id = (await submit(client)).json()["id"]
+    # Two rows written in one transaction share a created_at from now(); only
+    # the sequence separates them, which is what the id tie-break is for.
+    await repository.add_log(UUID(job_id), "info", "Claimed by w-1", {"priority": 5})
+    await repository.add_log(
+        UUID(job_id), "warning", "Attempt 1 failed; retrying", {"status": "pending"}
+    )
+    await db_session.flush()
+
+    response = await client.get(f"/jobs/{job_id}/logs")
+
+    assert response.status_code == 200
+    entries = response.json()["items"]
+    assert [entry["message"] for entry in entries] == [
+        "Job created with status pending",
+        "Claimed by w-1",
+        "Attempt 1 failed; retrying",
+    ]
+    assert [entry["level"] for entry in entries] == ["info", "info", "warning"]
+    assert entries[1]["meta"]["priority"] == 5
+
+
+async def test_e2e_35_history_of_an_unknown_job_is_a_404(client):
+    response = await client.get(f"/jobs/{uuid4()}/logs")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "job_not_found"
+
+
+async def test_e2e_36_history_pages_without_overlapping(client, db_session, repository):
+    job_id = (await submit(client)).json()["id"]
+    for index in range(3):
+        await repository.add_log(UUID(job_id), "info", f"event {index}", {})
+    await db_session.flush()
+
+    first = (await client.get(f"/jobs/{job_id}/logs", params={"limit": 2})).json()
+    second = (await client.get(f"/jobs/{job_id}/logs", params={"limit": 2, "offset": 2})).json()
+
+    assert first["has_more"] is True
+    assert second["has_more"] is False
+    assert len(first["items"]) == 2 and len(second["items"]) == 2
+    messages = [entry["message"] for entry in first["items"] + second["items"]]
+    assert messages == ["Job created with status pending", "event 0", "event 1", "event 2"]
+
+
+@pytest.mark.parametrize("limit", [0, 101])
+async def test_e2e_36b_out_of_range_history_limits_are_rejected(client, limit):
+    job_id = (await submit(client)).json()["id"]
+
+    assert (await client.get(f"/jobs/{job_id}/logs", params={"limit": limit})).status_code == 422
+
+
+async def test_e2e_37_history_never_carries_payload_contents(client):
+    secret = {"to": "victim@example.com", "subject": "s3cret-subject", "body": "s3cret-body"}
+    job_id = (await submit(client, payload=secret)).json()["id"]
+
+    text = (await client.get(f"/jobs/{job_id}/logs")).text
+
+    assert "s3cret-subject" not in text
+    assert "s3cret-body" not in text
+    assert "victim@example.com" not in text
+
+
+async def test_reading_history_writes_nothing(client, db_session):
+    job_id = (await submit(client)).json()["id"]
+    before = (await client.get(f"/jobs/{job_id}")).json()
+
+    await client.get(f"/jobs/{job_id}/logs")
+
+    assert (await client.get(f"/jobs/{job_id}")).json() == before
 
 
 # --------------------------------------------------------------------------

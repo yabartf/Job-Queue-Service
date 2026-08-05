@@ -91,6 +91,10 @@ Distinguishing 404 from 409 requires a second read when zero rows come back — 
 
 The endpoint is written this way now, before any worker exists, precisely so that the cancel-versus-claim race in spec 04 is already resolved correctly when the worker arrives.
 
+### `GET /jobs/{job_id}/logs` — history
+
+Added in `specs/10-job-history.md`, which owns the contract. Listed here so this section stays the complete set of endpoints: it returns the job's `job_logs` rows oldest first, paged like `GET /jobs`, and `404` for an unknown id.
+
 ### `GET /health`
 
 ```json
