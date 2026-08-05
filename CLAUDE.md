@@ -4,19 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Feature-complete against the assignment. Data model, job class hierarchy, the API, the worker (claiming, retry with backoff, lease/heartbeat/reaper, graceful shutdown, Redis dispatch, worker liveness), manual retry, job timeout enforcement and dead-letter routing. 476 tests, 100 % coverage.
+Feature-complete against the assignment. Data model, job class hierarchy, the API, the worker (claiming, retry with backoff, lease/heartbeat/reaper, graceful shutdown, Redis dispatch, worker liveness), manual retry, job timeout enforcement, dead-letter routing and job history. 488 tests, 100 % coverage.
 
 Deliberately not built, and recorded as such in `DECISIONS.md` §5: priority aging, job retention, backpressure, authentication.
 
 ## What this repository is
 
-A take-home assignment: a distributed background **job queue service** in Python, submitted as a Git repo for a Mid/Senior Backend role. Source spec: `C:\Users\yabar\Downloads\PY-Backend-Senior-job-queue-Kit-Assignment.pdf`.
+A distributed background **job queue service** in Python, built as a take-home assignment for a Mid/Senior Backend role and submitted as a Git repository.
 
 Four components: **API service** (submit/query) → **queue** (pending jobs) → **worker process(es)** (pull and execute) → **relational DB** (state and results). The worker must be a separate process; no in-request processing.
 
 ## Working method: spec before code (SDD)
 
-This is not optional here — the graders inspect the spec documents and check that the code matches them.
+This is not optional here. The specs are part of the deliverable, and a spec that no longer describes the code is a defect in the same way a failing test is.
 
 For every feature: write `specs/<nn>-<feature>.md` first, get it approved, then implement strictly to it. A spec covers the requirement, the design decision and its alternatives, edge cases, and acceptance criteria. If the implementation diverges, update the spec in the same change — a spec that no longer describes the code is worse than no spec.
 
@@ -115,6 +115,8 @@ Layering, enforced by review: **`api/` → `services/` → `db/` → PostgreSQL*
 **Returning a job to the queue is always two statements.** Both the reaper and the shutdown release must split on `attempts < max_attempts`: a job requeued with its attempts spent makes the next claim compute `attempts + 1` past the limit and violate `ck_jobs_attempts` — and since the claim picks by priority and age, that row is then selected first by every worker, so one bad row stops the whole fleet. The exhausted job is failed instead, and **not** dead-lettered: a deploy landing on it is not the job's fault, so it stays retryable. If a third path to `pending` is ever added, it needs the same split.
 
 **Redis never raises.** Every `Dispatch` method logs and degrades. Callers have a working fallback, so error handling at the call sites would be dead code. The corollary is that a broken dispatch is invisible unless something asserts on it — which is how a socket read timeout equal to the `BZPOPMIN` block went unnoticed: every idle poll raised, logged "Redis failed", and degraded to the fallback that makes it all still work. `from_url` derives the read budget from the longest block its caller will ask for; do not let it inherit a library default.
+
+**Degrading is not the same as returning early.** `next_hint` is the only pacing the slot loop has — `run_forever` has no sleep in its idle path, which is why `NullDispatch.next_hint` sleeps for the timeout it is handed. A refused connection fails in a round trip rather than in the interval the caller asked to wait, so `RedisDispatch.next_hint` must wait out the remainder of the block before answering `None`. Without it a Redis outage becomes a hot loop of claim queries against the one database the outage did not take away: measured on the running stack at 49 idle cycles in twenty seconds where the poll interval intends 8. Any future method the slot loop awaits for pacing carries the same obligation.
 
 **A slot loop must survive its own errors.** Nothing awaits a slot task until shutdown, so an escaping exception retires that slot permanently while the process stays up and keeps announcing itself as live. `run_forever` reports, waits one poll interval, and continues; anything already claimed is recovered by the reaper.
 

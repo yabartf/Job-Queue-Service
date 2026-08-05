@@ -1,4 +1,4 @@
-"""Use cases: submit, read, list and cancel jobs.
+"""Use cases: submit, read, list, cancel and retry jobs, and read their history.
 
 Owns the business rules and the transaction's unit of work. Contains no HTTP
 concepts — it raises domain errors and lets the API layer decide status codes.
@@ -14,7 +14,7 @@ from app.core.config import get_settings
 from app.core.enums import JobStatus
 from app.core.errors import JobNotCancellableError, JobNotFoundError, JobNotRetryableError
 from app.core.logging import get_logger, payload_fingerprint
-from app.db.models import Job
+from app.db.models import Job, JobLog
 from app.db.repository import JobFilters, JobRepository, NewJob
 from app.dispatch.base import Dispatch, NullDispatch
 from app.jobs.registry import get_job_class
@@ -112,6 +112,18 @@ class JobService:
         # non-HTTP caller must not be able to ask for an unbounded page either.
         capped = min(limit, get_settings().max_page_size)
         return await self.repo.list_jobs(filters, capped, offset)
+
+    async def get_logs(self, job_id: UUID, limit: int, offset: int) -> tuple[list[JobLog], bool]:
+        """A page of a job's audit trail.
+
+        The job is fetched first so an unknown id raises JobNotFoundError rather
+        than returning an empty page: "no such job" and "nothing happened yet"
+        are different answers, and a caller that cannot tell them apart will
+        report one as the other.
+        """
+        await self.get(job_id)
+        capped = min(limit, get_settings().max_page_size)
+        return await self.repo.list_logs(job_id, capped, offset)
 
     async def cancel(self, job_id: UUID) -> Job:
         """Cancel a pending or scheduled job.

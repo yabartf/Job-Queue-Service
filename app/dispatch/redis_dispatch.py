@@ -6,7 +6,9 @@ method below swallow its own failures — a Redis outage costs latency, never
 correctness, and the caller has a working fallback either way.
 """
 
+import asyncio
 from datetime import datetime
+from time import monotonic
 from typing import Any
 from uuid import UUID
 
@@ -75,6 +77,7 @@ class RedisDispatch:
         exactly like a wedged worker.
         """
         member: str | None = None
+        started = monotonic()
         try:
             if timeout is None:
                 popped = await self._client.zpopmin(READY_KEY)
@@ -85,6 +88,20 @@ class RedisDispatch:
                 member = str(result[1]) if result else None
         except RedisError:
             self._log.warning("dispatch.next_hint_failed")
+            # Wait out the rest of the block before answering. A refused
+            # connection fails in a round trip rather than in the interval the
+            # caller asked to wait, and this call is the *only* pacing the slot
+            # loop has — it has no sleep of its own, which is exactly why
+            # NullDispatch honours the timeout too. Returning early instead turns
+            # a Redis outage into a hot loop of claim queries against PostgreSQL:
+            # measured at roughly six times the intended rate per slot.
+            #
+            # The remainder, not the whole timeout: a read that timed out has
+            # already spent it, and sleeping again would double the idle latency.
+            if timeout is not None:
+                remaining = timeout - (monotonic() - started)
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
             return None
 
         return UUID(member) if member else None

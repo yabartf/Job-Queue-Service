@@ -180,6 +180,56 @@ async def test_w2_04_ten_workers_ten_jobs_claim_ten_distinct(committing_sessions
     assert len(set(claimed)) == 10  # SKIP LOCKED stepped over, never doubled up
 
 
+async def _cancel_with(sessions: async_sessionmaker[AsyncSession], job_id: UUID) -> UUID | None:
+    async with sessions() as session:
+        job = await JobRepository(session).cancel(job_id)
+        await session.commit()
+        return job.id if job else None
+
+
+async def test_w2_19_cancelling_and_claiming_race_to_a_single_outcome(committing_sessions):
+    """Cancel racing pickup — the interleaving spec 02 §3 was written for.
+
+    Both operations are conditional updates over the same row, so the row lock
+    arbitrates and application timing does not matter. Whichever arrives second
+    finds a status its WHERE clause does not name and changes nothing.
+
+    The invariant is per job: it is either cancelled and never claimed, or
+    claimed exactly once and never cancelled. Never both, never neither — a job
+    reported cancelled to a client while a worker is executing it is the failure
+    this shape exists to prevent.
+    """
+    async with committing_sessions() as session:
+        ids = [(await add_job(session)).id for _ in range(10)]
+        await session.commit()
+
+    # Interleaved so the two operations are submitted alternately rather than in
+    # two blocks, which is what puts them in the same instant.
+    outcomes = await asyncio.gather(
+        *(
+            coro
+            for job_id in ids
+            for coro in (
+                _cancel_with(committing_sessions, job_id),
+                _claim_with(committing_sessions, f"w-{job_id}"),
+            )
+        )
+    )
+
+    cancelled = {job_id for job_id in outcomes[0::2] if job_id is not None}
+    claimed = [job_id for job_id in outcomes[1::2] if job_id is not None]
+
+    assert len(claimed) == len(set(claimed)), "a job was claimed by two workers"
+    assert not cancelled & set(claimed), "a job was both cancelled and claimed"
+    assert cancelled | set(claimed) == set(ids), "a job ended up neither cancelled nor claimed"
+
+    async with committing_sessions() as session:
+        rows = (await session.execute(text("SELECT id, status FROM jobs"))).all()
+    for job_id, status in rows:
+        expected = JobStatus.CANCELLED if job_id in cancelled else JobStatus.PROCESSING
+        assert status == expected
+
+
 async def test_w2_07_a_displaced_worker_discards_its_own_result(committing_sessions):
     """The test the whole ownership design exists for.
 
