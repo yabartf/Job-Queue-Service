@@ -19,8 +19,6 @@ from app.core.config import Settings
 from app.core.enums import JobStatus, JobType
 from app.db.models import Job
 from app.dispatch.base import NullDispatch
-from app.jobs.base import BaseJob, JobPayload, JobResult
-from app.jobs.registry import JOB_REGISTRY
 from app.worker.runtime import Worker
 from tests.doubles import RecordingSleeper, StubRandom
 from tests.factories import add_job
@@ -31,37 +29,9 @@ BACKLOG = 200
 SLOTS = 4
 
 
-class ProbePayload(JobPayload):
-    marker: str
-
-
-class ProbeResult(JobResult):
-    marker: str
-
-
-@pytest.fixture
-def executions() -> list[UUID]:
-    """Swap a recording handler in for the duration of the test."""
-    recorded: list[UUID] = []
-
-    class ProbeJob(BaseJob):
-        job_type = JobType.EMAIL
-        Payload = ProbePayload
-        Result = ProbeResult
-
-        async def run(self) -> ProbeResult:
-            recorded.append(self.ctx.job_id)
-            return ProbeResult(marker=self.payload.marker)
-
-    original = JOB_REGISTRY[JobType.EMAIL]
-    JOB_REGISTRY[JobType.EMAIL] = ProbeJob
-    try:
-        yield recorded
-    finally:
-        JOB_REGISTRY[JobType.EMAIL] = original
-
-
-def build_worker(sessions, clock, **overrides) -> Worker:
+def build_worker(sessions, clock, dispatch=None, **overrides) -> Worker:
+    """A worker wired for tests. ``dispatch`` defaults to the no-Redis fallback;
+    W4-03 passes a real one to exercise the hint path under load."""
     values: dict = {
         "worker_concurrency": SLOTS,
         "worker_lease_seconds": 60,
@@ -75,7 +45,7 @@ def build_worker(sessions, clock, **overrides) -> Worker:
     return Worker(
         Settings(**values),
         sessions,
-        NullDispatch(),
+        dispatch or NullDispatch(),
         clock,
         rng=StubRandom(0.99),
         sleeper=RecordingSleeper(),

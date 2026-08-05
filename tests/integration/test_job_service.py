@@ -108,6 +108,29 @@ async def test_submit_is_idempotent_for_a_repeated_key(service, db_session):
     assert total == 1
 
 
+async def test_l2_22_an_idempotency_key_still_matches_a_day_later(service, db_session):
+    """The assignment requires keys to be honoured for at least 24 hours.
+
+    Nothing expires them — there is no retention sweep and no TTL — so the
+    requirement is met by the row simply still being there. That is worth a test
+    rather than a claim: the day a retention policy is added (DECISIONS.md §5),
+    this is what fails if it takes the key with it.
+    """
+    first, _ = await service.submit(submit_command(idempotency_key="k-24h"))
+    await db_session.flush()
+    await db_session.execute(
+        text("UPDATE jobs SET created_at = now() - interval '25 hours' WHERE id = :i"),
+        {"i": first.id},
+    )
+
+    second, created = await service.submit(submit_command(idempotency_key="k-24h"))
+
+    assert created is False
+    assert second.id == first.id
+    total = (await db_session.execute(select(func.count()).select_from(Job))).scalar_one()
+    assert total == 1
+
+
 async def test_idempotent_replay_with_a_different_payload_warns(service, db_session):
     await service.submit(submit_command(idempotency_key="k-2"))
     await db_session.flush()
