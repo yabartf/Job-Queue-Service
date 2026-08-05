@@ -198,6 +198,7 @@ Specs 03–08. The whole worker suite runs against `NullDispatch`, so the Postgr
 | W1-12 | slot: heartbeat loses the lease | handler task cancelled; no result written |
 | W1-13 | slot: nothing to claim | `run_once()` returns False and writes nothing |
 | W1-14 | dispatch read timeout | the client's socket budget exceeds the longest block it will carry, so an idle poll cannot be mistaken for a Redis failure |
+| W1-14c | dispatch fails while the caller asked to block | the failure still costs the block — the remainder of it, not the whole timeout again — while the non-blocking form returns at once |
 | W1-15 | slot: a cycle raises | the loop reports, waits one interval, and goes on claiming — it does not end the slot |
 
 ### W2 — integration, real PostgreSQL

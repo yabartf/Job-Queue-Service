@@ -4,6 +4,7 @@ from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
+from redis.exceptions import RedisError
 
 from app.core.enums import MAX_PRIORITY, MIN_PRIORITY
 from app.dispatch.base import (
@@ -136,3 +137,95 @@ def test_w1_14b_the_default_matches_a_caller_that_never_blocks():
     kwargs = dispatch._client.connection_pool.connection_kwargs
 
     assert kwargs["socket_timeout"] == BLOCK_TIMEOUT_MARGIN_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# W1-14c — a failed hint still costs the caller its block
+# ---------------------------------------------------------------------------
+
+
+class FailingClient:
+    """A client that cannot reach Redis. Both pops raise, as a refused
+    connection does, and neither waits for the timeout it was handed."""
+
+    async def zpopmin(self, key: str) -> object:
+        raise RedisError("connection refused")
+
+    async def bzpopmin(self, key: str, timeout: float) -> object:
+        raise RedisError("connection refused")
+
+
+@pytest.fixture
+def paced(monkeypatch):
+    """What `next_hint` waited, without the test waiting it too."""
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr("app.dispatch.redis_dispatch.asyncio.sleep", fake_sleep)
+    return slept
+
+
+def spend(monkeypatch, seconds: float) -> None:
+    """Make the failing call appear to have taken `seconds`, instantly.
+
+    The module imports `monotonic` by name so this replaces one name in one
+    module. Reaching through `redis_dispatch.time.monotonic` would patch the
+    stdlib module every other caller shares, pytest included.
+    """
+    readings = iter([100.0, 100.0 + seconds])
+    monkeypatch.setattr("app.dispatch.redis_dispatch.monotonic", lambda: next(readings))
+
+
+async def test_w1_14c_a_failed_hint_waits_out_the_block_it_was_given(paced, monkeypatch):
+    """The hazard NullDispatch's timeout exists to avoid, in the class that
+    actually runs in production.
+
+    `Slot.run_forever` has no sleep in its idle path — this call is the only
+    pacing it has. A refused connection fails in a round trip rather than in the
+    interval the caller asked to wait, so returning immediately leaves the slot
+    spinning: claim query, refused connect, repeat, for as long as Redis is down.
+    Measured against a live stack before this was fixed, 49 idle cycles in twenty
+    seconds where the poll interval intends 8.
+
+    Latency is not the cost. The cost is the claim query each cycle fires at
+    PostgreSQL — the one database the Redis outage has not taken away.
+    """
+    spend(monkeypatch, 0.0)
+    dispatch = RedisDispatch(FailingClient())  # type: ignore[arg-type]
+
+    assert await dispatch.next_hint(timeout=5.0) is None
+
+    assert paced == [5.0]
+
+
+async def test_a_failed_hint_waits_only_the_remainder(paced, monkeypatch):
+    """A read that timed out has already spent the block. Sleeping the whole
+    timeout again would double the idle interval every cycle."""
+    spend(monkeypatch, 4.0)
+    dispatch = RedisDispatch(FailingClient())  # type: ignore[arg-type]
+
+    assert await dispatch.next_hint(timeout=5.0) is None
+
+    assert paced == [1.0]
+
+
+async def test_a_failure_that_used_the_whole_block_does_not_wait_again(paced, monkeypatch):
+    spend(monkeypatch, 6.0)
+    dispatch = RedisDispatch(FailingClient())  # type: ignore[arg-type]
+
+    assert await dispatch.next_hint(timeout=5.0) is None
+
+    assert paced == []
+
+
+async def test_the_non_blocking_form_is_never_paced(paced, monkeypatch):
+    """`timeout=None` is the API's form — a submission and a health check both
+    use it. Only a caller that asked to wait may be made to."""
+    spend(monkeypatch, 0.0)
+    dispatch = RedisDispatch(FailingClient())  # type: ignore[arg-type]
+
+    assert await dispatch.next_hint() is None
+
+    assert paced == []
