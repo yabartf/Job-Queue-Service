@@ -4,19 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Feature-complete against the assignment. Data model, job class hierarchy, the API, the worker (claiming, retry with backoff, lease/heartbeat/reaper, graceful shutdown, Redis dispatch, worker liveness), manual retry, job timeout enforcement and dead-letter routing. 476 tests, 100 % coverage.
+Feature-complete against the assignment. Data model, job class hierarchy, the API, the worker (claiming, retry with backoff, lease/heartbeat/reaper, graceful shutdown, Redis dispatch, worker liveness), manual retry, job timeout enforcement, dead-letter routing and job history. 488 tests, 100 % coverage.
 
 Deliberately not built, and recorded as such in `DECISIONS.md` §5: priority aging, job retention, backpressure, authentication.
 
 ## What this repository is
 
-A take-home assignment: a distributed background **job queue service** in Python, submitted as a Git repo for a Mid/Senior Backend role. Source spec: `C:\Users\yabar\Downloads\PY-Backend-Senior-job-queue-Kit-Assignment.pdf`.
+A distributed background **job queue service** in Python, built as a take-home assignment for a Mid/Senior Backend role and submitted as a Git repository.
 
 Four components: **API service** (submit/query) → **queue** (pending jobs) → **worker process(es)** (pull and execute) → **relational DB** (state and results). The worker must be a separate process; no in-request processing.
 
 ## Working method: spec before code (SDD)
 
-This is not optional here — the graders inspect the spec documents and check that the code matches them.
+This is not optional here. The specs are part of the deliverable, and a spec that no longer describes the code is a defect in the same way a failing test is.
 
 For every feature: write `specs/<nn>-<feature>.md` first, get it approved, then implement strictly to it. A spec covers the requirement, the design decision and its alternatives, edge cases, and acceptance criteria. If the implementation diverges, update the spec in the same change — a spec that no longer describes the code is worse than no spec.
 

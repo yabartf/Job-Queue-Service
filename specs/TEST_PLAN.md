@@ -1,7 +1,7 @@
 ﻿# Test Plan
 
 **Status:** Accepted — implemented
-**Covers:** specs 01–02 (part 1, §6–§8), specs 03–08 (part 2, §9) and spec 09 (part 3, `tests/integration/test_hardening.py`). 464 tests, 100 % coverage.
+**Covers:** specs 01–02 (part 1, §6–§8), specs 03–08 (part 2, §9), spec 09 (part 3, `tests/integration/test_hardening.py`) and spec 10 (§12). 488 tests, 100 % coverage.
 
 ## 1. Principles
 
@@ -136,6 +136,8 @@ Coverage is a floor, not the goal: a covered line with no assertion about its be
 | L2-18 | `EXPLAIN` list-by-status | uses `ix_jobs_status_created` |
 | L2-19 | delete a job | its `job_logs` rows cascade |
 | L2-20 | transition helper | writes a `job_logs` row and emits a log line for the same transition |
+| L2-21 | `list_logs` | oldest first, ordered by the sequence rather than the shared `created_at`; `has_more` correct across pages; another job's rows excluded |
+| L2-22 | idempotency key 25 hours old | still matches; the existing job is returned and no second row is created |
 
 ## 8. L3 — E2E
 
@@ -169,6 +171,10 @@ Coverage is a floor, not the goal: a covered line with no assertion about its be
 | E2E-26 | force a 500 | body contains no `Traceback`, no SQL, no driver text |
 | E2E-27 | register a throwaway job type in-test and submit it | 201 — proves extensibility with no changes outside `app/jobs/` |
 | E2E-28 | logs captured during one request | all valid JSON, all carrying the response's `request_id` |
+| E2E-34 | a job's history | every transition, oldest first, with `meta` intact |
+| E2E-35 | history of an unknown id | 404, code `job_not_found` — not an empty page |
+| E2E-36 | history paginated | `has_more` correct; pages do not overlap; `limit` of 0 or 101 is 422 |
+| E2E-37 | history of a job with a sensitive payload | no field of the payload appears anywhere in the response |
 
 ## 9. Part 2 — worker
 
@@ -219,6 +225,7 @@ Specs 03–08. The whole worker suite runs against `NullDispatch`, so the Postgr
 | W2-16e | such a failure is not poison | no `dead_letter_reason`; a manual retry is accepted |
 | W2-17 | `EXPLAIN` on the claim | uses `ix_jobs_claim` |
 | W2-18 | Redis dispatch round trip | announce → `BZPOPMIN` returns it; a stale hint claims nothing and is dropped |
+| W2-19 | **cancel racing pickup** | ten cancels interleaved with ten claims over the same rows: every job ends either cancelled and never claimed, or claimed once and never cancelled |
 
 ### W3 — end to end
 
@@ -238,6 +245,19 @@ Specs 03–08. The whole worker suite runs against `NullDispatch`, so the Postgr
 |---|---|---|
 | W4-01 | 200 jobs, 4 slots, real PostgreSQL | **zero double executions** (the handler records every run), zero jobs left in `processing`, every job terminal |
 | W4-02 | same, with a worker killed mid-run | all jobs still reach a terminal state after the reaper sweeps |
+| W4-03 | 40 jobs arriving at **idle workers through a real Redis** | zero double executions, **and** at least one claim recorded `from_hint` |
+
+⚠️ **W4-03 needs the worker running before the work arrives.** A slot consults Redis only when its own scan came back empty (spec 03 §3), so seeding a backlog and then starting a worker exercises the PostgreSQL fallback with Redis merely attached — a test that passes identically with no dispatch at all. The worker therefore starts first and settles into `BZPOPMIN`.
+
+The `from_hint` assertion is the point of the test, and it is not decoration. Everything else in it is also true when the dispatch is broken, because that is what graceful degradation means; the claim's own `from_hint` flag in `job_logs` is the only thing that distinguishes "the hint path works" from "the fallback covered for it". Swapped to `NullDispatch` the test fails, which is how it was checked.
+
+### Multi-process coverage — a stated limit
+
+Every automated concurrency test runs **slots inside one process**, against real connections and real commits. Nothing in the suite starts a second OS process.
+
+That is a deliberate boundary, not an omission. What the tests must exercise is two claimants racing for one row, and a slot is a genuine claimant: its own session, its own connection, its own transaction, arbitrated by the same row lock a second process would meet. A subprocess would add scheduling, teardown and log-plumbing complexity to the most timing-sensitive tests in the suite while changing nothing about the mechanism under test — the guarantee comes from `FOR UPDATE SKIP LOCKED` and the conditional update, which know nothing about process boundaries.
+
+The multi-process case is covered instead by `docker-compose.yml` running two worker replicas by default, and by `DEMO.md` §10, which kills both and watches the reaper recover their work.
 
 ## 10. Traceability
 
@@ -247,7 +267,7 @@ The assignment names six required test scenarios. Where each one lives:
 |---|---|---|
 | Job submission and retrieval | E2E-01, E2E-14, L2-01 | **part 1** |
 | Cancellation | E2E-20…23, L2-09…11 | **part 1** |
-| Idempotency | E2E-11…13, L2-13…15 | **part 1** |
+| Idempotency | E2E-11…13, L2-13…15, L2-22 | **part 1** |
 | Job completion flow | W3-01, W1-08, W2-05 | **part 2** |
 | Job failure and retry | W2-12, W2-13, W1-09, W1-10 | **part 2** |
 | Priority ordering | W3-02, W2-01 | **part 2** |
@@ -276,6 +296,12 @@ H-10 is the one worth reading. Everything else here is machinery; that test is t
 
 The slot's timeout branch is covered in `tests/unit/test_slot.py`, including that it is not mistaken for losing the lease — confusing the two would mean a timed-out job records no outcome and waits for the reaper instead.
 
-## 12. Later additions
+## 12. Job history
+
+Spec 10. `GET /jobs/{id}/logs` in `tests/e2e/test_jobs_api.py` (E2E-34…37), `list_logs` in `tests/integration/test_repository.py` (L2-21).
+
+The case that matters is E2E-37. The endpoint returns `meta` as stored, which is safe only because submission records a payload's size and digest rather than its contents (spec 02 §7) — a property of a different module, three layers away, and one that a future log line could break without anything else failing. So it is asserted here as well as there.
+
+## 13. Later additions
 
 Priority aging, if it is ever implemented. Recorded so this plan stays the single source of truth.
