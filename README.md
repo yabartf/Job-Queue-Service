@@ -320,7 +320,7 @@ pip install -e ".[dev]"
 pytest --cov=app --cov-report=term-missing
 ```
 
-488 tests, 100 % coverage, in about three minutes.
+488 tests, 100 % coverage, in about 70 seconds. The first run after starting `db-test` is slower — a cold PostgreSQL and the migration to head.
 
 ```bash
 pytest tests/unit -q                          # no I/O at all, runs in under a second

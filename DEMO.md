@@ -275,13 +275,15 @@ hist $ID
 
 ```
 info     | Job created with status pending
-info     | Claimed by 7a73fcb9dae8-1-1          ← the worker that was killed
+info     | Claimed by 3de43e9f6f78-1-0          ← the worker that was killed
 warning  | Lease expired; returned to the queue
-info     | Claimed by 7a73fcb9dae8-1-0          ← a different slot picked it up
+info     | Claimed by 3de43e9f6f78-1-0          ← reclaimed after the restart
 info     | Job completed
 ```
 
-Every one of those rows was written by a different part of the system — the API, a worker that no longer exists, the reaper, and the worker that finished the job — and they read as one sequence.
+Every one of those rows was written by a different part of the system — the API, a worker process that no longer exists, the reaper, and the worker that finished the job — and they read as one sequence.
+
+The two claim lines often carry the **same** id, which is not a mistake: a worker's identity is its hostname, pid and slot, and a restarted container gets its hostname back and starts at pid 1 again. Identity is per slot, not per lifetime — which is exactly why `worker_id` alone cannot prove ownership and `attempts` is the fencing token (DECISIONS.md §1).
 
 - [ ] passed
 
