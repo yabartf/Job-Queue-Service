@@ -30,6 +30,8 @@ MAX_ERROR_MESSAGE_CHARS = 500
 
 LEASE_EXPIRED_MESSAGE = "Worker stopped extending the lease"
 
+SHUTDOWN_INTERRUPTED_MESSAGE = "Worker shut down before the final attempt could finish"
+
 
 @dataclass(frozen=True, slots=True)
 class SweepResult:
@@ -178,25 +180,37 @@ class ExecutionService:
         return await self.repo.set_progress(own, percent)
 
     async def release(self, own: Ownership) -> bool:
-        """Hand a job back untouched, because this worker is shutting down.
+        """Hand a job back, because this worker is shutting down.
 
         Doing this rather than letting the lease lapse is what keeps a rolling
         deploy from hiding every in-flight job for a full lease duration.
+
+        A job interrupted on its last attempt cannot go back to the queue — the
+        next claim would breach ck_jobs_attempts — so it ends `failed` instead.
+        The repository decides which of the two happened, because the answer is
+        a property of the row and not of anything this worker knows.
         """
-        released = await self.repo.release_lease(own)
-        if released:
-            await record_event(
-                self.repo,
-                self.log,
-                own.job_id,
-                event="worker.forced_release",
-                message="Released mid-flight during shutdown",
-                level="warning",
-                worker_id=own.worker_id,
-                attempt=own.attempts,
-                status=JobStatus.PENDING,
-            )
-        return released
+        outcome = await self.repo.release_lease(own, self._shutdown_error())
+        if outcome is None:
+            return False
+
+        requeued = outcome == JobStatus.PENDING
+        await record_event(
+            self.repo,
+            self.log,
+            own.job_id,
+            event="worker.forced_release",
+            message=(
+                "Released mid-flight during shutdown"
+                if requeued
+                else "Shutdown interrupted the final attempt; no attempts left to requeue it"
+            ),
+            level="warning" if requeued else "error",
+            worker_id=own.worker_id,
+            attempt=own.attempts,
+            status=outcome,
+        )
+        return True
 
     async def sweep(self, batch: int) -> SweepResult:
         """One maintenance pass: recover abandoned jobs, then promote due ones."""
@@ -280,6 +294,14 @@ class ExecutionService:
 
     def _lease_expired_error(self) -> dict[str, Any]:
         return {"type": "LeaseExpired", "message": LEASE_EXPIRED_MESSAGE}
+
+    def _shutdown_error(self) -> dict[str, Any]:
+        """Recorded when a shutdown catches a job on its final attempt.
+
+        Deliberately not a dead letter: nothing about the job made it fail, so it
+        stays retryable and an operator draining the incident can requeue it.
+        """
+        return {"type": "WorkerShutdown", "message": SHUTDOWN_INTERRUPTED_MESSAGE}
 
     async def _report_lost(self, job: Job, own: Ownership) -> None:
         """A write matched nothing: the reaper handed this job to someone else.

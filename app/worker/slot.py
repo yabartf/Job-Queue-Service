@@ -10,7 +10,7 @@ import random
 from typing import Any
 from uuid import UUID
 
-from app.core.clock import Sleeper
+from app.core.clock import Sleeper, sleep_unless_stopped
 from app.core.errors import DomainError
 from app.core.logging import get_logger
 from app.db.models import Job
@@ -78,7 +78,24 @@ class Slot:
         """
         hint: UUID | None = None
         while not stop.is_set():
-            if await self.run_once(hint):
+            try:
+                claimed = await self.run_once(hint)
+            except Exception:
+                # Nothing awaits this task until shutdown, so an escaping
+                # exception would end the slot silently and permanently: the
+                # process stays up, keeps announcing itself as live, and claims
+                # nothing ever again. The causes are transient — a database
+                # blip, a schema not yet migrated — so the loop reports and
+                # waits out one interval rather than spinning on a dependency
+                # that is still down. A job already claimed stays `processing`
+                # and the reaper recovers it; that path is spec 06 §4.
+                self._log.exception("slot.cycle_failed", worker_id=self.worker_id)
+                hint = None
+                if await sleep_unless_stopped(stop, self._poll_interval_seconds):
+                    return
+                continue
+
+            if claimed:
                 hint = None
                 continue
             hint = await self._dispatch.next_hint(timeout=self._poll_interval_seconds)

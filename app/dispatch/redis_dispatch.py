@@ -19,6 +19,17 @@ from app.dispatch.base import dispatch_score
 READY_KEY = "jobs:ready"
 WORKER_KEY_PREFIX = "worker:"
 
+#: How much longer the socket may wait than the command it is carrying.
+#:
+#: redis-py defaults ``socket_timeout`` to 5 seconds, and a blocking pop that
+#: asks the *server* to wait that long loses the race against its own socket:
+#: the read times out first and the pop raises instead of returning empty. The
+#: symptom is a warning on every idle poll — indistinguishable from the warning
+#: that means Redis is actually gone — plus a discarded connection each time.
+#: So the read timeout is derived from the longest block the caller will ask
+#: for, rather than left to a library default nothing here can see.
+BLOCK_TIMEOUT_MARGIN_SECONDS = 5.0
+
 
 class RedisDispatch:
     def __init__(self, client: Redis, logger: Any | None = None) -> None:
@@ -26,10 +37,26 @@ class RedisDispatch:
         self._log = logger or get_logger(__name__)
 
     @classmethod
-    def from_url(cls, url: str, logger: Any | None = None) -> "RedisDispatch":
+    def from_url(
+        cls,
+        url: str,
+        logger: Any | None = None,
+        *,
+        max_block_seconds: float = 0.0,
+    ) -> "RedisDispatch":
         # decode_responses so members come back as str rather than bytes; the
         # only things stored are ids and worker names.
-        return cls(Redis.from_url(url, decode_responses=True), logger)
+        #
+        # max_block_seconds is 0 for the API, which never blocks; the worker
+        # passes its poll interval.
+        return cls(
+            Redis.from_url(
+                url,
+                decode_responses=True,
+                socket_timeout=max_block_seconds + BLOCK_TIMEOUT_MARGIN_SECONDS,
+            ),
+            logger,
+        )
 
     async def announce(self, job_id: UUID, priority: int, created_at: datetime) -> None:
         try:

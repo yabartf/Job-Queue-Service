@@ -42,7 +42,11 @@ async def run_worker(stop: asyncio.Event, settings: Settings | None = None) -> N
     configure_logging(settings.log_level)
 
     engine = create_engine(settings.database_url)
-    dispatch = RedisDispatch.from_url(settings.redis_url)
+    # The worker is the only caller that blocks on Redis, so it is the only one
+    # whose socket timeout has to clear the block it asks for.
+    dispatch = RedisDispatch.from_url(
+        settings.redis_url, max_block_seconds=settings.worker_poll_interval_seconds
+    )
     worker = Worker(settings, make_session_factory(engine), dispatch, SystemClock())
     try:
         await worker.run(stop)

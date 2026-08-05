@@ -91,12 +91,26 @@ Any job still running is cancelled, and **its lease is explicitly released**:
 
 ```sql
 UPDATE jobs SET status='pending', worker_id=NULL, lease_until=NULL
-WHERE id=:id AND worker_id=:worker AND attempts=:attempts AND status='processing';
+WHERE id=:id AND worker_id=:worker AND attempts=:attempts AND status='processing'
+  AND attempts < max_attempts;
 ```
 
 Doing this rather than letting the lease lapse matters operationally. A deploy that rolls twenty workers would otherwise leave every in-flight job invisible for a full lease duration before the reaper notices — a minute of unexplained latency on every release. Releasing on the way out makes the job claimable immediately, and turns a routine deploy into a non-event.
 
 The released attempt is still consumed, which is correct: the job did start, and a job that repeatedly gets caught by shutdowns should not retry indefinitely.
+
+**And that is why this needs the same second statement the reaper does.** `attempts < max_attempts` is not decoration. A job released back to `pending` having spent its last attempt is a landmine: the next claim computes `attempts + 1` past the limit and `ck_jobs_attempts` raises. Because the claim selects by priority and age, that one row is picked first by *every* worker, so a single interrupted final attempt takes down claiming for the whole fleet — and the reaper cannot clear it, since the job is `pending` rather than `processing`. A job released with nothing left is therefore failed instead:
+
+```sql
+UPDATE jobs SET status='failed', error=:shutdown_error, completed_at=now(),
+                worker_id=NULL, lease_until=NULL
+WHERE id=:id AND worker_id=:worker AND attempts=:attempts AND status='processing'
+  AND attempts >= max_attempts;
+```
+
+The two predicates are disjoint, so the order between them does not matter, and a job taken away in between matches neither — the ordinary "we lost it" answer.
+
+It is failed but **not** dead-lettered. Nothing about the job caused this; a deploy landed on it. It stays retryable, which is exactly what an operator draining the deploy needs. That distinction is spec 09 §4.
 
 The container's `stop_grace_period` must exceed `SHUTDOWN_GRACE_SECONDS`, or Docker sends `SIGKILL` mid-cleanup and the explicit release never runs. `docker-compose.yml` sets 40 s against a 30 s grace.
 
@@ -109,4 +123,6 @@ The container's `stop_grace_period` must exceed `SHUTDOWN_GRACE_SECONDS`, or Doc
 - A heartbeat that matches zero rows cancels the running handler.
 - `SIGTERM` during execution: the running job completes, no new job is claimed, the process exits within the grace period.
 - A job still running when the grace period expires is left `pending` with `worker_id` and `lease_until` cleared, and is claimable at once.
+- A job released on its **final** attempt becomes `failed`, not `pending`; a claim issued straight afterwards succeeds and returns a different job.
+- That failure carries no `dead_letter_reason`, and `POST /jobs/{id}/retry` accepts it.
 - `SIGKILL` on a worker leaves its job recoverable by the reaper with no manual intervention.

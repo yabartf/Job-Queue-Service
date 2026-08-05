@@ -11,6 +11,7 @@ from app.dispatch.base import (
     NullDispatch,
     dispatch_score,
 )
+from app.dispatch.redis_dispatch import BLOCK_TIMEOUT_MARGIN_SECONDS, RedisDispatch
 
 NOW = datetime(2026, 8, 4, 12, 0, tzinfo=UTC)
 
@@ -104,3 +105,34 @@ async def test_w1_06d_null_dispatch_closes_and_heartbeats_quietly():
 
     await dispatch.heartbeat_worker("w-0", 40)
     await dispatch.close()
+
+
+# ---------------------------------------------------------------------------
+# W1-14 — the socket outlives the command it carries
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("block", [0.0, 1.0, 5.0, 30.0])
+def test_w1_14_the_read_timeout_clears_the_longest_block(block):
+    """redis-py defaults `socket_timeout` to 5 s. A blocking pop asking the
+    server to wait that long loses the race with its own socket, so every idle
+    poll raises instead of returning empty — logged as the same failure that
+    means Redis is gone, and costing a discarded connection each time. The
+    client's read budget is therefore derived from the block, not inherited.
+    """
+    dispatch = RedisDispatch.from_url("redis://localhost:6379/0", max_block_seconds=block)
+
+    socket_timeout = dispatch._client.connection_pool.connection_kwargs["socket_timeout"]
+
+    assert socket_timeout > block
+    assert socket_timeout == block + BLOCK_TIMEOUT_MARGIN_SECONDS
+
+
+def test_w1_14b_the_default_matches_a_caller_that_never_blocks():
+    """The API only ever announces and reads depth, so it keeps redis-py's own
+    default rather than an inflated one."""
+    dispatch = RedisDispatch.from_url("redis://localhost:6379/0")
+
+    kwargs = dispatch._client.connection_pool.connection_kwargs
+
+    assert kwargs["socket_timeout"] == BLOCK_TIMEOUT_MARGIN_SECONDS

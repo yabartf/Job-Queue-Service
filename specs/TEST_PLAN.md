@@ -191,6 +191,8 @@ Specs 03–08. The whole worker suite runs against `NullDispatch`, so the Postgr
 | W1-11 | slot: unparseable stored payload | `mark_failed` on the **first** attempt |
 | W1-12 | slot: heartbeat loses the lease | handler task cancelled; no result written |
 | W1-13 | slot: nothing to claim | `run_once()` returns False and writes nothing |
+| W1-14 | dispatch read timeout | the client's socket budget exceeds the longest block it will carry, so an idle poll cannot be mistaken for a Redis failure |
+| W1-15 | slot: a cycle raises | the loop reports, waits one interval, and goes on claiming — it does not end the slot |
 
 ### W2 — integration, real PostgreSQL
 
@@ -212,6 +214,9 @@ Specs 03–08. The whole worker suite runs against `NullDispatch`, so the Postgr
 | W2-14 | progress writes | visible on the row while the job runs; ignored once ownership is lost |
 | W2-15 | graceful shutdown | in-flight job completes, no new job claimed, process exits within the grace period |
 | W2-16 | forced shutdown | job left `pending` with the lease cleared, claimable at once |
+| W2-16c | **forced shutdown on the final attempt** | `failed`, not `pending` — a requeue here would breach `ck_jobs_attempts` on the next claim and wedge claiming for every worker |
+| W2-16d | the claim after such a release | succeeds and returns a different job, rather than raising |
+| W2-16e | such a failure is not poison | no `dead_letter_reason`; a manual retry is accepted |
 | W2-17 | `EXPLAIN` on the claim | uses `ix_jobs_claim` |
 | W2-18 | Redis dispatch round trip | announce → `BZPOPMIN` returns it; a stale hint claims nothing and is dropped |
 

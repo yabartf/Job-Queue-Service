@@ -303,6 +303,23 @@ async def test_release_without_ownership_is_silent(execution, db_session):
     assert not any(e["event"] == "worker.forced_release" for e in entries)
 
 
+async def test_releasing_a_final_attempt_reports_a_failure_not_a_requeue(execution, db_session):
+    """The job cannot go back to the queue, and the log line has to say so —
+    an operator reading `status: pending` here would wait for a run that the
+    attempt counter has already made impossible."""
+    job, own = await claimed(execution, db_session, max_attempts=1)
+
+    with capture_logs() as entries:
+        assert await execution.release(own) is True
+
+    await db_session.refresh(job)
+    assert job.status == JobStatus.FAILED
+    assert job.error["type"] == "WorkerShutdown"
+    event = next(e for e in entries if e["event"] == "worker.forced_release")
+    assert event["status"] == JobStatus.FAILED
+    assert event["log_level"] == "error"
+
+
 # ---------------------------------------------------------------------------
 # Maintenance
 # ---------------------------------------------------------------------------

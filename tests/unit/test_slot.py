@@ -302,3 +302,59 @@ async def test_run_forever_stops_when_asked():
     await asyncio.wait_for(slot.run_forever(stop), timeout=2)
 
     assert service.claims == []
+
+
+async def test_w1_15_a_failed_cycle_does_not_end_the_slot():
+    """Nothing awaits a slot task until shutdown, so an escaping exception would
+    retire the slot in silence: the process stays up, keeps announcing itself as
+    live, and claims nothing again. Transient database errors are ordinary."""
+    job = build_claimed_job()
+    service = FakeExecutionService(jobs=[job])
+    original_claim = service.claim
+    failed_once = False
+
+    async def claim(*args, **kwargs):
+        nonlocal failed_once
+        if not failed_once:
+            failed_once = True
+            raise OSError("connection reset by peer")
+        return await original_claim(*args, **kwargs)
+
+    service.claim = claim  # type: ignore[method-assign]
+    slot = build_slot(service)
+    stop = asyncio.Event()
+
+    async def stop_once_recovered() -> None:
+        while not service.completed:
+            await asyncio.sleep(0)
+        stop.set()
+
+    await asyncio.wait_for(asyncio.gather(slot.run_forever(stop), stop_once_recovered()), timeout=5)
+
+    assert [job_id for job_id, _ in service.completed] == [job.id]
+
+
+async def test_w1_15b_a_failing_cycle_waits_instead_of_spinning():
+    """A dependency that is down stays down for longer than one iteration, and a
+    loop that retried immediately would turn an outage into a hot loop against
+    the very dependency that is struggling."""
+    service = FakeExecutionService(jobs=[])
+    attempts = 0
+
+    async def always_fails(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise OSError("database is down")
+
+    service.claim = always_fails  # type: ignore[method-assign]
+    interval = 0.05
+    slot = build_slot(service, poll_interval_seconds=interval)
+    stop = asyncio.Event()
+
+    task = asyncio.create_task(slot.run_forever(stop))
+    await asyncio.sleep(interval * 4)
+    stop.set()
+    await asyncio.wait_for(task, timeout=2)
+
+    # One attempt per interval, give or take scheduling — not thousands.
+    assert 1 <= attempts <= 8

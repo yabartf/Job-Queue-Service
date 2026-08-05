@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Status
 
-Feature-complete against the assignment. Data model, job class hierarchy, the API, the worker (claiming, retry with backoff, lease/heartbeat/reaper, graceful shutdown, Redis dispatch, worker liveness), manual retry, job timeout enforcement and dead-letter routing. 464 tests, 100 % coverage.
+Feature-complete against the assignment. Data model, job class hierarchy, the API, the worker (claiming, retry with backoff, lease/heartbeat/reaper, graceful shutdown, Redis dispatch, worker liveness), manual retry, job timeout enforcement and dead-letter routing. 476 tests, 100 % coverage.
 
 Deliberately not built, and recorded as such in `DECISIONS.md` §5: priority aging, job retention, backpressure, authentication.
 
@@ -112,7 +112,11 @@ Layering, enforced by review: **`api/` → `services/` → `db/` → PostgreSQL*
 
 **Do not add `announce` calls to the maintenance sweeps.** Reaped and promoted jobs reach a worker through the fallback claim within one poll interval. Announcing them would mean carrying priority and creation time out of a batch `UPDATE ... RETURNING` purely to rebuild a Redis score, for a few seconds on jobs that are already late.
 
-**Redis never raises.** Every `Dispatch` method logs and degrades. Callers have a working fallback, so error handling at the call sites would be dead code.
+**Returning a job to the queue is always two statements.** Both the reaper and the shutdown release must split on `attempts < max_attempts`: a job requeued with its attempts spent makes the next claim compute `attempts + 1` past the limit and violate `ck_jobs_attempts` — and since the claim picks by priority and age, that row is then selected first by every worker, so one bad row stops the whole fleet. The exhausted job is failed instead, and **not** dead-lettered: a deploy landing on it is not the job's fault, so it stays retryable. If a third path to `pending` is ever added, it needs the same split.
+
+**Redis never raises.** Every `Dispatch` method logs and degrades. Callers have a working fallback, so error handling at the call sites would be dead code. The corollary is that a broken dispatch is invisible unless something asserts on it — which is how a socket read timeout equal to the `BZPOPMIN` block went unnoticed: every idle poll raised, logged "Redis failed", and degraded to the fallback that makes it all still work. `from_url` derives the read budget from the longest block its caller will ask for; do not let it inherit a library default.
+
+**A slot loop must survive its own errors.** Nothing awaits a slot task until shutdown, so an escaping exception retires that slot permanently while the process stays up and keeps announcing itself as live. `run_forever` reports, waits one poll interval, and continues; anything already claimed is recovered by the reaper.
 
 **Dead-letter is a classification, not a status.** `dead_letter_reason` is NULL unless a failure means the job *cannot run* — an unparseable payload, a timeout on every attempt, a worker killed every time. A job that exhausted its attempts on ordinary handler exceptions gets NULL and stays retryable, because it did its work and the thing it called was down. Do not add a seventh status for this; the enum, the CHECK constraint, the transition table and every status filter would all have to change to express what `failed` already says.
 

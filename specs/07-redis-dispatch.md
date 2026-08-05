@@ -57,6 +57,20 @@ A failed `announce` is logged and swallowed. The job is already durably `pending
 
 **Submission is the only thing that announces.** Jobs the reaper releases and jobs the promoter makes due are *not* re-announced: they reach a worker through the fallback claim, within one poll interval. Announcing them would mean carrying each job's priority and creation time out of a batch `UPDATE ... RETURNING` purely to reconstruct a score, in exchange for a few seconds on jobs that are by definition already late. The queue's correctness does not change either way — invariant 6 holds regardless — so the simpler side of that trade is the right one.
 
+### The blocking wait needs a socket that outlives it
+
+`next_hint(timeout)` asks Redis to hold the connection open for up to `timeout` seconds. The client has its own read deadline, and **redis-py defaults it to 5 seconds** — the same order as a sensible poll interval, and in fact exactly `WORKER_POLL_INTERVAL_SECONDS`.
+
+When the two are equal the socket always wins. The pop raises `redis.exceptions.TimeoutError` instead of returning empty, so a perfectly idle queue is reported as a Redis failure — logged with the same event that means the server is gone, once per slot per interval, forever. The signal that should have announced a real outage is on permanently, and redis-py discards a connection after each read timeout, so every idle poll also costs a fresh TCP connection and handshake.
+
+Nothing breaks: `next_hint` degrades to "no hint" and the fallback claim carries the work, which is why the system looks healthy while doing this. The client's read budget is therefore **derived** from the longest block its caller will request rather than inherited from a library default:
+
+```
+socket_timeout = max_block_seconds + BLOCK_TIMEOUT_MARGIN_SECONDS
+```
+
+The worker passes its poll interval; the API passes nothing, because it only announces and reads depth and never blocks. Tests pin the relationship, not the numbers.
+
 ## 6. Stale entries
 
 Entries are never removed on cancellation, and this is deliberate. A cancelled job stays in the sorted set until a worker pops it, attempts the conditional claim, matches zero rows, and drops it. **The set cleans itself as a side effect of normal operation**, which is cheaper and simpler than keeping two stores transactionally aligned — the exact coupling this design exists to avoid.
@@ -87,6 +101,7 @@ No path through any of these loses, duplicates, or strands a job.
 - A submitted job is announced only after its row is visible to another connection.
 - `BZPOPMIN` returns the highest-priority job, and the oldest within that priority.
 - A cancelled job left in the set is popped once, claimed by nobody, and disappears.
+- An idle blocking poll returns empty and logs **nothing**; a client whose read deadline only matches its block logs a failure, and that difference is asserted.
 - **With Redis stopped, submitted jobs still reach `completed`**; restarting it requires no intervention.
 - The whole worker test suite passes against `NullDispatch`, exercising only the fallback path.
 - Encoded scores stay below 2^53 across the full legal priority range.

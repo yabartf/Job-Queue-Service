@@ -12,6 +12,7 @@ from tests.factories import add_job, add_processing_job
 
 LEASE = 60
 EXPIRY_ERROR = {"type": "LeaseExpired", "message": "Worker stopped extending the lease"}
+SHUTDOWN_ERROR = {"type": "WorkerShutdown", "message": "Worker shut down mid-attempt"}
 
 
 def expired_at() -> datetime:
@@ -128,7 +129,7 @@ async def test_release_lease_hands_a_job_back_without_an_outcome(repository, db_
     job = await repository.claim_next("w-0", LEASE)
     assert job is not None
 
-    assert await repository.release_lease(Ownership.of(job)) is True
+    assert await repository.release_lease(Ownership.of(job), SHUTDOWN_ERROR) == JobStatus.PENDING
 
     await db_session.refresh(job)
     assert job.status == JobStatus.PENDING
@@ -143,10 +144,59 @@ async def test_release_lease_after_losing_ownership_does_nothing(repository, db_
     assert job is not None
     stale = Ownership(job_id=job.id, worker_id="w-0", attempts=job.attempts - 1)
 
-    assert await repository.release_lease(stale) is False
+    assert await repository.release_lease(stale, SHUTDOWN_ERROR) is None
 
     await db_session.refresh(job)
     assert job.status == JobStatus.PROCESSING
+
+
+async def test_w2_16c_releasing_the_final_attempt_fails_it_instead_of_requeueing(
+    repository, db_session
+):
+    """The mirror of the reaper's second statement, and the one that was missing.
+
+    A job released back to `pending` with no attempts left is a landmine: the
+    next claim computes attempts + 1 past the limit and ck_jobs_attempts raises.
+    Because the claim picks by priority, that one row would break claiming for
+    every worker, not just the one that released it.
+    """
+    await add_job(db_session, max_attempts=1)
+    job = await repository.claim_next("w-0", LEASE)
+    assert job is not None
+    assert job.attempts == job.max_attempts  # nothing left to retry with
+
+    assert await repository.release_lease(Ownership.of(job), SHUTDOWN_ERROR) == JobStatus.FAILED
+
+    await db_session.refresh(job)
+    assert job.status == JobStatus.FAILED
+    assert job.error == SHUTDOWN_ERROR
+    assert job.worker_id is None and job.lease_until is None
+
+
+async def test_w2_16d_a_released_final_attempt_does_not_wedge_the_claim(repository, db_session):
+    """The failure this exists to prevent, asserted end to end."""
+    await add_job(db_session, max_attempts=1)
+    job = await repository.claim_next("w-0", LEASE)
+    assert job is not None
+    await repository.release_lease(Ownership.of(job), SHUTDOWN_ERROR)
+    await add_job(db_session, priority=0)  # a later job the wedge would have hidden
+
+    claimed = await repository.claim_next("w-1", LEASE)
+
+    assert claimed is not None
+    assert claimed.id != job.id  # the exhausted job is out of the queue, not in it
+
+
+async def test_w2_16e_a_shutdown_failure_is_not_poison(repository, db_session):
+    """Nothing about the job made it fail, so a manual retry must still work."""
+    await add_job(db_session, max_attempts=1)
+    job = await repository.claim_next("w-0", LEASE)
+    assert job is not None
+    await repository.release_lease(Ownership.of(job), SHUTDOWN_ERROR)
+
+    await db_session.refresh(job)
+    assert job.dead_letter_reason is None
+    assert await repository.retry_failed(job.id) is not None
 
 
 # ---------------------------------------------------------------------------

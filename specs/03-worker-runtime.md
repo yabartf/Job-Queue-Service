@@ -44,13 +44,30 @@ async def run_once(self) -> bool:
 
 async def run_forever(self, stop: asyncio.Event) -> None:
     while not stop.is_set():
-        if not await self.run_once():
+        try:
+            claimed = await self.run_once()
+        except Exception:
+            log.exception("slot.cycle_failed")
+            if await sleep_unless_stopped(stop, poll_interval):
+                return
+            continue
+        if not claimed:
             await self.dispatch.next_hint(timeout=poll_interval)  # blocks
 ```
 
-`run_once` exists as a separate method for one reason: **almost every test drives it directly.** A loop that can only be started and stopped forces every test to reason about timing; a loop with a single-step entry point does not. `run_forever` adds nothing but the wait.
+`run_once` exists as a separate method for one reason: **almost every test drives it directly.** A loop that can only be started and stopped forces every test to reason about timing; a loop with a single-step entry point does not. `run_forever` adds the wait — and the only place in the worker that decides a failure is survivable.
 
 When `run_once` returns `True` the loop immediately tries again rather than waiting. A backlog is drained continuously; the wait happens only when the queue is genuinely empty.
+
+### Why the loop cannot let an exception out
+
+Nothing awaits a slot task until shutdown: `Worker.run` creates them and then parks on the stop event (§7). An exception escaping `run_once` would therefore end that slot **permanently and in silence** — the process stays up, the liveness key keeps being refreshed, `/health` keeps reporting a live worker, and it never claims again. With `WORKER_CONCURRENCY=1` the process becomes a convincing zombie; the only symptom is `oldest_pending_seconds` climbing on an endpoint nobody is watching at 3am.
+
+The causes are ordinary and transient: a dropped connection, a failover, a schema not yet migrated when the container started. So the loop reports and waits out one poll interval rather than retrying instantly — a dependency that is down stays down for longer than one iteration, and an immediate retry would turn an outage into a hot loop against the thing already struggling.
+
+A job that was already claimed when the failure hit stays `processing` and is recovered by the reaper on the ordinary path (spec 06 §4). Nothing here tries to be cleverer than that.
+
+The maintenance sweep has had the same guard since it was written (§7). The slot loop is where it matters more.
 
 ## 4. Executing a job
 

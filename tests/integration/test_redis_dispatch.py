@@ -12,17 +12,25 @@ from uuid import uuid4
 import pytest
 from redis.asyncio import Redis
 from redis.exceptions import RedisError
+from structlog.testing import capture_logs
 
 from app.core.config import get_settings
 from app.dispatch.redis_dispatch import READY_KEY, RedisDispatch
 
 NOW = datetime(2026, 8, 4, 12, 0, tzinfo=UTC)
 
+#: Long enough to be a real blocking wait, short enough to run in a suite.
+BLOCK = 0.3
+
 
 @pytest.fixture
-async def dispatch():
-    url = os.getenv("TEST_REDIS_URL") or get_settings().test_redis_url
-    client = Redis.from_url(url, decode_responses=True)
+def redis_url() -> str:
+    return os.getenv("TEST_REDIS_URL") or get_settings().test_redis_url
+
+
+@pytest.fixture
+async def dispatch(redis_url):
+    client = Redis.from_url(redis_url, decode_responses=True)
     try:
         await client.ping()
     except (RedisError, OSError):
@@ -100,6 +108,38 @@ async def test_a_blocking_wait_returns_work_that_is_already_there(dispatch):
     await dispatch.announce(job_id, 5, NOW)
 
     assert await dispatch.next_hint(timeout=1) == job_id
+
+
+async def test_w1_14b_an_idle_poll_is_not_reported_as_a_redis_failure(dispatch, redis_url):
+    """Why `from_url` derives the read timeout instead of inheriting one.
+
+    A client whose socket budget only matches the block it is carrying loses the
+    race against its own read: the pop raises instead of returning empty, and an
+    idle poll is reported as a Redis failure that never happened — the same log
+    line that means the server is gone, emitted every interval by every slot
+    against a perfectly healthy Redis.
+
+    This shipped: redis-py's 5 s default against a 5 s poll interval. The
+    invariant is pinned here at a duration the suite can afford, since what
+    matters is the relationship between the two numbers, not their size.
+    """
+    inherited = RedisDispatch(
+        Redis.from_url(redis_url, decode_responses=True, socket_timeout=BLOCK)
+    )
+    derived = RedisDispatch.from_url(redis_url, max_block_seconds=BLOCK)
+
+    try:
+        with capture_logs() as inherited_logs:
+            assert await inherited.next_hint(timeout=BLOCK) is None
+        with capture_logs() as derived_logs:
+            assert await derived.next_hint(timeout=BLOCK) is None
+    finally:
+        await inherited.close()
+        await derived.close()
+
+    # Both degrade to "no hint" — only one of them had anything to degrade from.
+    assert any(e["event"] == "dispatch.next_hint_failed" for e in inherited_logs)
+    assert not any(e["event"] == "dispatch.next_hint_failed" for e in derived_logs)
 
 
 async def test_worker_liveness_expires_on_its_own(dispatch):

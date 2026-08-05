@@ -231,7 +231,9 @@ class JobRepository:
             Job.status == JobStatus.PROCESSING,
         )
 
-    async def _update_owned(self, own: Ownership, **values: Any) -> bool:
+    async def _update_owned(
+        self, own: Ownership, *extra: ColumnElement[bool], **values: Any
+    ) -> bool:
         """Apply a write only if the caller still owns the job.
 
         Returns False when ownership was lost — not an error, and never a reason
@@ -240,8 +242,12 @@ class JobRepository:
         Ownership is decided by whether a row came back, not by ``rowcount``:
         RETURNING is what the rest of this module uses, and it says exactly what
         was touched rather than how many rows a driver counted.
+
+        ``extra`` narrows the write further, for callers whose outcome depends on
+        the row's own columns. Deciding that in SQL rather than from a value read
+        earlier is what keeps the decision and the write in one statement.
         """
-        stmt = update(Job).where(*self._owned(own)).values(**values).returning(Job.id)
+        stmt = update(Job).where(*self._owned(own), *extra).values(**values).returning(Job.id)
         return (await self.session.execute(stmt)).scalars().first() is not None
 
     async def _sweep(
@@ -407,11 +413,41 @@ class JobRepository:
             lease_until=None,
         )
 
-    async def release_lease(self, own: Ownership) -> bool:
-        """Hand a job back without recording an outcome, on forced shutdown."""
-        return await self._update_owned(
-            own, status=JobStatus.PENDING, worker_id=None, lease_until=None
-        )
+    async def release_lease(self, own: Ownership, exhausted_error: dict[str, Any]) -> str | None:
+        """Hand a job back on forced shutdown. Returns the status it ended in.
+
+        Two statements with disjoint predicates, for the same reason as
+        reap_expired_leases: a job released with `attempts = max_attempts` cannot
+        go back to the queue, because the next claim would compute
+        `attempts + 1` beyond the limit and violate ck_jobs_attempts — wedging
+        not just this job but every claim that selects it. Exactly one predicate
+        can match, so the order between them does not matter, and a job taken
+        away between the two matches neither, which is the ordinary "we lost it"
+        answer.
+
+        The exhausted job is failed but **not** dead-lettered. It is not poison:
+        it was interrupted by a deploy, not by anything about the job, so a
+        manual retry is exactly the right response and must stay available.
+        """
+        if await self._update_owned(
+            own,
+            Job.attempts < Job.max_attempts,
+            status=JobStatus.PENDING,
+            worker_id=None,
+            lease_until=None,
+        ):
+            return JobStatus.PENDING
+        if await self._update_owned(
+            own,
+            Job.attempts >= Job.max_attempts,
+            status=JobStatus.FAILED,
+            error=exhausted_error,
+            completed_at=func.now(),
+            worker_id=None,
+            lease_until=None,
+        ):
+            return JobStatus.FAILED
+        return None
 
     async def reap_expired_leases(
         self,
