@@ -12,6 +12,8 @@ from app.api.deps import get_job_service, get_session
 from app.api.schemas import JobResponse
 from app.core.config import Settings
 from app.core.enums import DeadLetterReason, JobStatus, JobType
+from app.db.repository import Ownership
+from app.jobs.base import JobExecutionError
 from tests.factories import add_job
 
 EMAIL_PAYLOAD = {"to": "user@example.com", "subject": "Hi", "body": "Hello"}
@@ -480,15 +482,53 @@ async def test_e2e_36b_out_of_range_history_limits_are_rejected(client, limit):
     assert (await client.get(f"/jobs/{job_id}/logs", params={"limit": limit})).status_code == 422
 
 
-async def test_e2e_37_history_never_carries_payload_contents(client):
+async def test_e2e_37_history_never_carries_payload_contents(client, db_session, execution):
+    """Every row a real run writes, not just the submission row.
+
+    The endpoint returns `meta` as stored, so the property holds only as long as
+    no writer puts payload contents there. Reading a freshly submitted job would
+    inspect `payload_fingerprint` alone and pass while the claim, the handler's
+    own note and the failure — the rows carrying worker-supplied values — went
+    unexamined, which is the same shape of vacuous test this suite has been
+    bitten by twice (AI_USAGE.md). So the job is driven through them first.
+
+    The failure is raised with the payload in its message on purpose: `jobs.error`
+    keeps that text and `job_logs` records the exception's class name instead,
+    which is the distinction spec 10 section 3 rests on.
+    """
     secret = {"to": "victim@example.com", "subject": "s3cret-subject", "body": "s3cret-body"}
     job_id = (await submit(client, payload=secret)).json()["id"]
+    await db_session.flush()
 
-    text = (await client.get(f"/jobs/{job_id}/logs")).text
+    job = await execution.claim("w-0", 60)
+    assert job is not None and job.id == UUID(job_id)
+    await execution.note(job.id, "info", "Delivering", provider="smtp")
+    await execution.fail(
+        job,
+        Ownership.of(job),
+        JobExecutionError(f"SMTP rejected {secret['to']}: s3cret-body"),
+    )
+    await db_session.flush()
+    # The failure write expired the row this session is holding. A real request
+    # would load it fresh; here the API shares the session, so it is dropped from
+    # the identity map rather than refreshed lazily under Pydantic.
+    db_session.expunge_all()
 
-    assert "s3cret-subject" not in text
-    assert "s3cret-body" not in text
-    assert "victim@example.com" not in text
+    history = await client.get(f"/jobs/{job_id}/logs")
+
+    # Asserted first, so the checks below cannot pass by inspecting rows that
+    # were never written.
+    assert [entry["message"] for entry in history.json()["items"]] == [
+        "Job created with status pending",
+        "Claimed by w-0",
+        "Delivering",
+        "Attempt 1 failed; retrying",
+    ]
+    for value in ("s3cret-subject", "s3cret-body", "victim@example.com"):
+        assert value not in history.text
+    # The same string is reachable one endpoint over, which is what makes its
+    # absence above a property of `job_logs` rather than of the test's inputs.
+    assert "s3cret-body" in (await client.get(f"/jobs/{job_id}")).text
 
 
 async def test_reading_history_writes_nothing(client, db_session):

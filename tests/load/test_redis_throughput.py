@@ -39,22 +39,38 @@ JOBS = 40
 #: between polls, which is what makes an arriving job reach it as a hint.
 POLL = 1.0
 
+#: The same budget `drain` allows in test_throughput. A wait with no ceiling is
+#: the wrong failure for this test in particular: the defect it exists to catch
+#: is a hint path that stops handing work out, and that is exactly the shape
+#: that would leave the loop below spinning until CI kills the whole suite
+#: instead of failing here with a name.
+TIMEOUT = 60.0
+
 
 @pytest.fixture
 async def dispatch():
     url = os.getenv("TEST_REDIS_URL") or get_settings().test_redis_url
-    client = Redis.from_url(url, decode_responses=True)
+    admin = Redis.from_url(url, decode_responses=True)
     try:
-        await client.ping()
+        await admin.ping()
     except (RedisError, OSError):
-        await client.aclose()
+        await admin.aclose()
         pytest.skip("no Redis reachable at TEST_REDIS_URL")
 
-    await client.flushdb()
-    instance = RedisDispatch(client)
-    yield instance
-    await client.flushdb()
-    await instance.close()
+    await admin.flushdb()
+    # Built through `from_url`, the way the worker builds it — not
+    # `RedisDispatch(Redis.from_url(...))`, which inherits redis-py's socket
+    # defaults instead of the read budget derived from the block this test asks
+    # for. With no derived budget a regression there is invisible here, and the
+    # one test billed as running the production path would not be running it.
+    # Housekeeping goes through a separate client, since a dispatch exposes none.
+    instance = RedisDispatch.from_url(url, max_block_seconds=POLL)
+    try:
+        yield instance
+    finally:
+        await instance.close()
+        await admin.flushdb()
+        await admin.aclose()
 
 
 async def announce_everything(sessions, dispatch) -> None:
@@ -63,6 +79,11 @@ async def announce_everything(sessions, dispatch) -> None:
         rows = (await session.execute(select(Job.id, Job.priority, Job.created_at))).all()
     for job_id, priority, created_at in rows:
         await dispatch.announce(job_id, priority, created_at)
+
+
+async def drained(sessions) -> None:
+    while await count_where(sessions, "status IN ('pending','processing')"):
+        await asyncio.sleep(0.02)
 
 
 async def claims_from_a_hint(sessions) -> int:
@@ -91,11 +112,10 @@ async def test_w4_03_a_backlog_arriving_at_idle_workers_runs_exactly_once(
     await announce_everything(pooled_sessions, dispatch)
 
     try:
-        while await count_where(pooled_sessions, "status IN ('pending','processing')"):
-            await asyncio.sleep(0.02)
+        await asyncio.wait_for(drained(pooled_sessions), timeout=TIMEOUT)
     finally:
         stop.set()
-        await asyncio.wait_for(task, timeout=30)
+        await asyncio.wait_for(task, timeout=TIMEOUT)
 
     assert len(executions) == JOBS, "some job ran more or fewer times than once"
     assert len(set(executions)) == JOBS, "a job was executed twice"

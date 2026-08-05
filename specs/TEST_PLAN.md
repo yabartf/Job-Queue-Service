@@ -174,7 +174,7 @@ Coverage is a floor, not the goal: a covered line with no assertion about its be
 | E2E-34 | a job's history | every transition, oldest first, with `meta` intact |
 | E2E-35 | history of an unknown id | 404, code `job_not_found` — not an empty page |
 | E2E-36 | history paginated | `has_more` correct; pages do not overlap; `limit` of 0 or 101 is 422 |
-| E2E-37 | history of a job with a sensitive payload | no field of the payload appears anywhere in the response |
+| E2E-37 | a sensitive payload driven through claim, note and failure | no field of the payload appears in any of the four rows, while the same string is still returned by `GET /jobs/{id}` |
 
 ## 9. Part 2 — worker
 
@@ -251,6 +251,8 @@ Specs 03–08. The whole worker suite runs against `NullDispatch`, so the Postgr
 
 The `from_hint` assertion is the point of the test, and it is not decoration. Everything else in it is also true when the dispatch is broken, because that is what graceful degradation means; the claim's own `from_hint` flag in `job_logs` is the only thing that distinguishes "the hint path works" from "the fallback covered for it". Swapped to `NullDispatch` the test fails, which is how it was checked.
 
+Two smaller things follow from the same principle. The dispatch is built through `RedisDispatch.from_url(url, max_block_seconds=POLL)` rather than `RedisDispatch(Redis.from_url(...))`, because only the former derives the socket read budget the worker actually runs with — wrapping a default client would leave the one test billed as exercising the production path silently not exercising it (W1-14b pins the derivation itself). And the wait for the backlog to clear is bounded by `asyncio.wait_for`, as `drain` bounds W4-01 and W4-02: a hint path that stops handing work out is the defect this test exists to catch, and an unbounded wait would answer it by hanging the suite rather than by failing.
+
 ### Multi-process coverage — a stated limit
 
 Every automated concurrency test runs **slots inside one process**, against real connections and real commits. Nothing in the suite starts a second OS process.
@@ -301,6 +303,8 @@ The slot's timeout branch is covered in `tests/unit/test_slot.py`, including tha
 Spec 10. `GET /jobs/{id}/logs` in `tests/e2e/test_jobs_api.py` (E2E-34…37), `list_logs` in `tests/integration/test_repository.py` (L2-21).
 
 The case that matters is E2E-37. The endpoint returns `meta` as stored, which is safe only because submission records a payload's size and digest rather than its contents (spec 02 §7) — a property of a different module, three layers away, and one that a future log line could break without anything else failing. So it is asserted here as well as there.
+
+Reading a freshly submitted job would not have asserted it. That job has one row, whose `meta` is the fingerprint; the rows that carry worker-supplied values — the claim, a handler's own note through `ExecutionService.note`, the failure — would all have gone unexamined. The test therefore claims the job, notes a line and fails it before reading, and it raises the failure with the payload inside the exception message: `jobs.error` keeps that text and `job_logs` records only the exception's class name, which is the distinction §3 of spec 10 rests on. `GET /jobs/{id}` is asserted to still return the string, so its absence from the history is a property of `job_logs` rather than of the test's own inputs.
 
 ## 13. Later additions
 

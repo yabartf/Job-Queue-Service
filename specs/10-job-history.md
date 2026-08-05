@@ -92,5 +92,5 @@ GET /jobs/{id}/logs → JobService.get_logs → JobRepository.list_logs → Post
 - Two rows written in one transaction come back in the order they were written.
 - An unknown job id returns `404`; a `limit` of 0 or 101 returns `422`.
 - Paging with `limit=2` twice returns four distinct rows and reports `has_more` correctly at each step.
-- No response from this endpoint contains any value from a job's `payload`.
+- No response from this endpoint contains any value from a job's `payload` — asserted over a job that has been claimed, has had a handler note recorded against it, and has failed with its payload inside the exception message, not merely over one that was submitted.
 - The endpoint performs no write: a job's `status`, `attempts` and `updated_at` are unchanged by reading its history.
