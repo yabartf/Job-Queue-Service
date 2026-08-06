@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Feature-complete against the assignment. Data model, job class hierarchy, the API, the worker (claiming, retry with backoff, lease/heartbeat/reaper, graceful shutdown, Redis dispatch, worker liveness), manual retry, job timeout enforcement, dead-letter routing and job history. 493 tests, 100 % coverage.
 
-Deliberately not built, and recorded as such in `DECISIONS.md` §5: priority aging, job retention, backpressure, authentication.
+Deliberately not built, and recorded as such in `DECISIONS.md` §5: priority aging, job retention, backpressure and rate limiting, authentication.
 
 ## What this repository is
 
