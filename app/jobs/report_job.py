@@ -40,7 +40,7 @@ class ReportJob(BaseJob):
     payload: ReportPayload
 
     # Reports are the slowest job type here, so they get more headroom before
-    # the timeout enforced in spec 14 applies.
+    # the timeout enforced in spec 09 §3 applies.
     timeout_seconds = 120
 
     async def run(self) -> ReportResult:

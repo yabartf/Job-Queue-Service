@@ -25,13 +25,14 @@ Every requirement in the assignment, with the code that satisfies it and the tes
 | Python 3.11+, relational database | 3.12, PostgreSQL 16, SQLAlchemy async | — |
 | Queue/cache technology | Redis sorted set as a dispatch hint · [`app/dispatch/`](app/dispatch/) | `W2-18`, `W4-03` |
 | Separate worker process | [`app/worker/`](app/worker/) — `python -m app.worker`, no FastAPI import | `W3-01` |
+| **A job is picked up by exactly one worker** | one conditional `UPDATE … FOR UPDATE SKIP LOCKED`, and `attempts` as a fencing token on every write after it | `W2-03`, `W2-04`, `W2-07`, `W4-01` |
 | Submit a job | `POST /jobs` · [`app/api/routes/jobs.py`](app/api/routes/jobs.py) | `E2E-01` |
 | Get status, result or error | `GET /jobs/{id}` | `E2E-14` |
 | List with filters | `GET /jobs?status=&job_type=` | `E2E-17`, `E2E-18` |
 | Cancel a job | `POST /jobs/{id}/cancel` — conditional `UPDATE` | `E2E-20…23` |
 | Retry a failed job | `POST /jobs/{id}/retry` — attempts reset | `H-01`, `E2E-29` |
 | Health with queue statistics | `GET /health` · [`routes/health.py`](app/api/routes/health.py) | `E2E-24`, `W3-04` |
-| Retry with backoff, 3 attempts | [`app/services/backoff.py`](app/services/backoff.py) — 30 s, 2 min, equal jitter | `W1-01…03`, `W2-12` |
+| Retry with backoff, 3 attempts | [`app/services/backoff.py`](app/services/backoff.py) — 30 s then 2 min nominal, equal jitter, so **15–30 s** then **60–120 s** | `W1-01…03`, `W2-12` |
 | Priority-based processing | `ORDER BY priority DESC, created_at ASC` in the claim | `W2-01`, `W3-02` |
 | Containerised, both services | [`docker-compose.yml`](docker-compose.yml) | — |
 | Job submission and retrieval | | `E2E-01`, `E2E-14`, `L2-01` |
@@ -68,7 +69,7 @@ Every requirement in the assignment, with the code that satisfies it and the tes
 | Payload validation as a security boundary | per-type Pydantic schemas, SSRF rules, body size cap | `L1-20…26b`, `E2E-07`, `E2E-08` |
 | Request correlation | `X-Request-ID` on every response and log line | `E2E-25` |
 
-Two requirements are met by a property rather than by code, so they are stated rather than linked. **Idempotency keys are retained for at least 24 hours** because nothing ever expires them — there is no TTL and no retention sweep, which `L2-22` pins against the day one is added. **No polling hot-loop**: an idle slot blocks in Redis `BZPOPMIN` rather than spinning, and a busy one never waits at all.
+Two requirements are met by a property rather than by code, so they are stated rather than linked. **Idempotency keys are retained for at least 24 hours** because nothing expires them, and that is chosen rather than merely true: the requirement is a floor, and expiring a key would mean a client retrying its submission later quietly gets a *second job* instead of the original. `L2-22` ages a key past 25 hours and asserts the replay still matches, so the day a retention policy takes the key with it, a test fails first. The cost — a table that grows without bound — is real, unsolved, and needs its own design work; the constraints it inherits are written out in [`specs/01`](specs/01-data-model.md) §8. **No polling hot-loop**: an idle slot blocks in Redis `BZPOPMIN` rather than spinning, and a busy one never waits at all.
 
 ## Submitting a test job
 
@@ -95,6 +96,7 @@ curl -sS -X POST http://localhost:8000/jobs \
   "payload": {"to": "user@example.com", "subject": "Hello", "body": "Hi there", "cc": []},
   "result": null,
   "error": null,
+  "dead_letter_reason": null,
   "idempotency_key": "demo-1",
   "scheduled_at": null,
   "created_at": "2026-08-04T08:25:33.771534Z",
@@ -217,6 +219,16 @@ Priority, scheduling and exactly-once pickup are all this one query — three re
 
 Every write after the claim repeats `worker_id` *and* `attempts` in its `WHERE` clause. `attempts` increments on every claim, so it is a fencing token: a worker displaced by the reaper finds its own completion write matches zero rows, and discards its result rather than overwriting the work of whoever took over. `worker_id` alone would not be enough — two slots in one process would share it.
 
+### Claimed once is not the same as executed once
+
+Only the first is a guarantee, and the difference is worth stating plainly rather than leaving in a limitations list.
+
+**Exactly one worker ever claims a given attempt.** That is what the statement above buys, and `W2-03` (ten workers, one job, one winner) and `W4-01` (two hundred jobs drained by four slots, every execution recorded, zero of them double) are what hold it.
+
+**A job can still run more than once.** A worker that stalls past its lease has its job returned to the queue and handed to someone else while the original is still executing. Its writes are then rejected by the fencing token — `W2-07` — but a side effect it already performed has happened.
+
+This is not a gap in the implementation; it is forced by the problem. Nothing can distinguish a worker that has died from one that is merely slow, so recovering jobs from crashed workers and never handing a job to a second worker cannot both hold. Choosing recovery means at-least-once delivery. What the design does about it is bound the overlap: losing the lease cancels the running handler within one heartbeat, so the second execution stops early rather than running in full. Closing it completely needs idempotent handlers, which is [`DECISIONS.md`](DECISIONS.md) §5.
+
 ## Job types
 
 | Type | Payload | Result |
@@ -234,10 +246,14 @@ Each type declares its own schema, defaults and behaviour in one module under [`
 
 ```json
 {
+  "status": "ok",
+  "version": "0.1.0",
+  "uptime_seconds": 660,
   "database": "ok",
   "redis": "ok",
-  "queue": {"pending": 17, "processing": 4, "completed": 340, "failed": 3,
-            "oldest_pending_seconds": 12, "ready_hints": 17},
+  "queue": {"scheduled": 0, "pending": 17, "processing": 4, "completed": 340,
+            "failed": 3, "cancelled": 0,
+            "oldest_pending_seconds": 12, "ready_hints": 17, "dead_lettered": 0},
   "workers": {"count": 4, "ids": ["hostA-7-0", "hostA-7-1", "hostB-9-0", "hostB-9-1"]}
 }
 ```
@@ -320,7 +336,7 @@ pip install -e ".[dev]"
 pytest --cov=app --cov-report=term-missing
 ```
 
-488 tests, 100 % coverage, in about 70 seconds. The first run after starting `db-test` is slower — a cold PostgreSQL and the migration to head.
+493 tests, 100 % coverage, in about 85 seconds. The first run after starting `db-test` is slower — a cold PostgreSQL and the migration to head.
 
 ```bash
 pytest tests/unit -q                          # no I/O at all, runs in under a second
@@ -427,7 +443,8 @@ The specifications were written and reviewed before the code, and the code was w
 Stated deliberately; the reasoning for each is in [`DECISIONS.md`](DECISIONS.md) §5.
 
 - Delivery is **at-least-once**, not exactly-once. A worker stalled past its lease can have its job reclaimed and rerun; its writes are rejected, but side effects it already performed have happened. Handlers must be idempotent.
-- **No aging**, so a sustained stream of high-priority work can starve low-priority jobs.
+- **No aging**, so a sustained stream of high-priority work can starve low-priority jobs. It shows up as `oldest_pending_seconds` climbing while throughput stays healthy. Writing the age into the `ORDER BY` would cost the claim index — measured, and compared against the three approaches that do not, in [`specs/04`](specs/04-claiming.md) §4.
+- **No backpressure and no rate limiting.** Submission is unbounded. For a queue the relevant mechanism is a depth ceiling rather than requests per second, and a shared-state limiter would have to choose between failing open and failing closed against a Redis this design keeps non-authoritative on purpose — [`DECISIONS.md`](DECISIONS.md) §5.
 - **No authentication.** Anyone who can reach the API can read any job whose id they know. Random UUIDs are obscurity, not authorization.
 - **SSRF protection is incomplete by construction.** A hostname that resolves publicly at submission can resolve inward by execution time; closing that gap requires pinning the resolved address in the HTTP client at request time.
-- **No retention policy**, so terminal jobs — and their idempotency keys — accumulate without bound.
+- **No retention policy**, so terminal jobs — and their idempotency keys — accumulate without bound. Keeping the keys is deliberate; keeping every row forever is the price, and a policy is future work with constraints already recorded in [`specs/01`](specs/01-data-model.md) §8.

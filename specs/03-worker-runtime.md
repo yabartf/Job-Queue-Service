@@ -43,17 +43,23 @@ async def run_once(self) -> bool:
 
 
 async def run_forever(self, stop: asyncio.Event) -> None:
+    hint = None
     while not stop.is_set():
         try:
-            claimed = await self.run_once()
+            claimed = await self.run_once(hint)
         except Exception:
             log.exception("slot.cycle_failed")
+            hint = None
             if await sleep_unless_stopped(stop, poll_interval):
                 return
             continue
-        if not claimed:
-            await self.dispatch.next_hint(timeout=poll_interval)  # blocks
+        if claimed:
+            hint = None
+            continue
+        hint = await self.dispatch.next_hint(timeout=poll_interval)  # blocks
 ```
+
+A hint arrives as an argument to the next `run_once` rather than opening a second execution path: there is one way a job gets run, and the hint only changes which row is tried first.
 
 `run_once` exists as a separate method for one reason: **almost every test drives it directly.** A loop that can only be started and stopped forces every test to reason about timing; a loop with a single-step entry point does not. `run_forever` adds the wait — and the only place in the worker that decides a failure is survivable.
 

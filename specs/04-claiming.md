@@ -83,7 +83,30 @@ Promoted jobs are **not** announced to Redis; they reach a worker through the fa
 
 **Ordering is per-claim, not global.** With N workers, each takes the highest-priority job *available to it* — `SKIP LOCKED` steps over what another worker already holds. This is inherent to any concurrent queue and is not a defect. Its practical consequence is a testing rule: **a priority-ordering test must run a single worker**, or it is flaky by construction rather than by accident.
 
-**Low priority can starve.** A sustained stream of high-priority work means priority-0 jobs never run. Aging (`ORDER BY priority + f(age)`) is a one-line change to this query; what it needs is a decision about how fast a job should age, which is a product question. Not implemented — DECISIONS.md §5.
+**Low priority can starve, and aging is not a one-line fix.** A sustained stream of high-priority work means priority-0 jobs never run. Not implemented — DECISIONS.md §5 — and the reason it is not is worth stating precisely, because the obvious fix looks free and is not.
+
+Writing the age into the sort key does work as a diff:
+
+```sql
+ORDER BY priority + LEAST(EXTRACT(epoch FROM now() - created_at) / 600, 5) DESC, created_at
+```
+
+and it costs the index. Measured with `EXPLAIN` against a real database:
+
+| Sort key | Plan |
+|---|---|
+| `priority DESC, created_at` | `Index Scan using ix_jobs_claim` — stops at the first eligible row |
+| the expression above | `Sort` over the whole eligible set, feeding from `ix_jobs_status_created` |
+
+A sort key that depends on `now()` is not a stored value, so no index can supply it in order. Every claim, from every worker, would read all eligible rows, evaluate the expression per row and sort — O(n log n) where it is now O(log n), on the most frequent query in the system and precisely under the large backlog where dequeue efficiency is being judged. `W2-17` is what fails first: it asserts the plan uses `ix_jobs_claim`.
+
+Three approaches keep the index, and each pays somewhere else:
+
+1. **A promotion sweep** raises `priority` on old rows by `UPDATE` in the maintenance pass. The index is untouched; the cost is write amplification and that the `priority` a client reads back is no longer the one it submitted.
+2. **Lottery** — every Nth claim ignores priority and takes the oldest eligible job through `ix_jobs_created`. Starvation gets a ceiling of N claims rather than a gradient, for a few lines in `claim_next`.
+3. **A stored effective priority** recomputed by the sweep, so the ordering stays over a materialised column.
+
+Choosing between them needs a decision about how fast a job should age, which is a product question this project has no basis to answer. What it does not need is the impression that the answer is one line.
 
 **Retry backoffs sit inside the claim index.** A `pending` job with a future `scheduled_at` is in `ix_jobs_claim` but not yet eligible, so the index scan walks over it. With a large backlog of waiting retries this costs a few extra index entries per claim. It cannot be indexed away — `now()` is not immutable, so no partial index can express "due" — and at this scale it is not worth a second mechanism.
 

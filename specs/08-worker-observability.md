@@ -53,7 +53,17 @@ Populated from the Redis liveness keys (spec 07 §7). When Redis is unreachable 
 
 **"I cannot see the workers" and "there are no workers" are different incidents** with different responses, and reporting the second when the first is true sends an operator to restart healthy workers during a Redis outage.
 
-`ready_hints` is `ZCARD` of the dispatch set. Comparing it to `pending` is a direct read on dispatch health: they should track, and a large gap means announcements are failing and everything is arriving via the slower fallback path.
+`ready_hints` is `ZCARD` of the dispatch set. Comparing it to `pending` is a direct read on dispatch health, but **the comparison is directional and an earlier version of this section had it symmetric**, which reads a healthy drain as a failure:
+
+| Reading | Meaning |
+|---|---|
+| `ready_hints` **below** `pending` | announcements are failing; work is arriving through the slower fallback |
+| `ready_hints` **above** `pending` | ordinary while a backlog drains — see below |
+| `ready_hints` high while `pending` is **0** | the fault worth alerting on: a dispatch nothing is reading |
+
+The middle row is the one that surprises. A slot consults the dispatch only when its own claim came back empty (spec 03 §3), so the moment there is a backlog the set stops being consumed while submissions keep adding to it. Measured on the running stack: a burst of 60 jobs left `ready_hints` at 56 for twenty-six seconds while `pending` fell from 48 to 0, and it dropped to 0 the instant the queue emptied and the slots went back to blocking on `BZPOPMIN` — clearing the stale entries as spec 07 §6 describes. Four of the sixty claims recorded `from_hint`, which is exactly the four the set was short of sixty.
+
+Both numbers were correct throughout. Only the rule for reading them was wrong.
 
 ## 3. Log events
 

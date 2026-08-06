@@ -288,7 +288,7 @@ async def test_run_forever_drains_without_waiting_between_jobs():
             await asyncio.sleep(0)
         stop.set()
 
-    await asyncio.gather(slot.run_forever(stop), stop_once_drained())
+    await asyncio.wait_for(asyncio.gather(slot.run_forever(stop), stop_once_drained()), timeout=5)
 
     assert len(service.completed) == 3
 
@@ -358,3 +358,28 @@ async def test_w1_15b_a_failing_cycle_waits_instead_of_spinning():
 
     # One attempt per interval, give or take scheduling — not thousands.
     assert 1 <= attempts <= 8
+
+
+async def test_w1_15c_a_shutdown_during_that_wait_ends_the_loop():
+    """The wait after a failed cycle is the one place a slot sits for a whole
+    interval, so it is where a shutdown is most likely to land. It has to end
+    there rather than wait the interval out and run one more cycle against the
+    dependency that just failed — with a production interval that is five
+    seconds added to every deploy, per slot."""
+    service = FakeExecutionService(jobs=[])
+    stop = asyncio.Event()
+    attempts = 0
+
+    async def fails_as_the_worker_is_told_to_stop(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        stop.set()
+        raise OSError("database is down")
+
+    service.claim = fails_as_the_worker_is_told_to_stop  # type: ignore[method-assign]
+    # Long enough that waiting it out would hit the timeout below instead.
+    slot = build_slot(service, poll_interval_seconds=30)
+
+    await asyncio.wait_for(slot.run_forever(stop), timeout=2)
+
+    assert attempts == 1  # it returned from the wait, rather than going round again

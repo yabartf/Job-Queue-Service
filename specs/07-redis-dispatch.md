@@ -71,6 +71,16 @@ socket_timeout = max_block_seconds + BLOCK_TIMEOUT_MARGIN_SECONDS
 
 The worker passes its poll interval; the API passes nothing, because it only announces and reads depth and never blocks. Tests pin the relationship, not the numbers.
 
+### A failed hint still has to cost the block
+
+`next_hint` is the **only pacing the slot loop has** — `run_forever` has no sleep in its idle path, which is why `NullDispatch.next_hint` sleeps for the timeout it is handed rather than returning at once.
+
+A refused connection fails in a round trip. The failure branch therefore cannot simply log and return `None`: doing so hands control straight back to a loop with nothing else to wait on, and a Redis outage becomes a hot loop of claim queries against the one database the outage did not take away. Measured on the running stack: **49 idle cycles in twenty seconds where the poll interval intends 8**, per two slots.
+
+So the failure branch waits out **the remainder** of the block before answering — the remainder rather than the whole timeout, because a read that timed out has already spent it, and sleeping the full amount again would double the idle interval. Re-measured after the fix: 10.
+
+The rule this generalises to: **degrading is not the same as returning early.** Any future method the slot loop awaits for pacing carries the same obligation, and W1-14c is what holds it.
+
 ## 6. Stale entries
 
 Entries are never removed on cancellation, and this is deliberate. A cancelled job stays in the sorted set until a worker pops it, attempts the conditional claim, matches zero rows, and drops it. **The set cleans itself as a side effect of normal operation**, which is cheaper and simpler than keeping two stores transactionally aligned — the exact coupling this design exists to avoid.
@@ -90,7 +100,7 @@ If Redis is down, `/health` reports worker status as unknown rather than as zero
 | Failure | Effect |
 |---|---|
 | Redis unreachable at startup | worker and API run with `NullDispatch`; jobs flow through the fallback claim |
-| Redis dies while running | `next_hint` raises, is logged, and the slot proceeds to the fallback claim |
+| Redis dies while running | `next_hint` raises, is logged, waits out the rest of the block it was asked for, and the slot proceeds to the fallback claim at its ordinary pace |
 | Redis data lost entirely | nothing is lost; the set repopulates from new submissions and maintenance sweeps |
 | Redis recovers | new announcements resume; latency returns to normal with no intervention |
 
@@ -103,6 +113,7 @@ No path through any of these loses, duplicates, or strands a job.
 - A cancelled job left in the set is popped once, claimed by nobody, and disappears.
 - An idle blocking poll returns empty and logs **nothing**; a client whose read deadline only matches its block logs a failure, and that difference is asserted.
 - **With Redis stopped, submitted jobs still reach `completed`**; restarting it requires no intervention.
+- With Redis stopped, an idle slot claims at its poll interval and not faster: a failed hint costs the remainder of the block it was asked for, while the non-blocking form still returns at once.
 - The whole worker test suite passes against `NullDispatch`, exercising only the fallback path.
 - Encoded scores stay below 2^53 across the full legal priority range.
 - With Redis down, `/health` reports worker status as unknown, not as zero workers.
