@@ -443,7 +443,7 @@ The specifications were written and reviewed before the code, and the code was w
 Stated deliberately; the reasoning for each is in [`DECISIONS.md`](DECISIONS.md) §5.
 
 - Delivery is **at-least-once**, not exactly-once. A worker stalled past its lease can have its job reclaimed and rerun; its writes are rejected, but side effects it already performed have happened. Handlers must be idempotent.
-- **No aging**, so a sustained stream of high-priority work can starve low-priority jobs.
+- **No aging**, so a sustained stream of high-priority work can starve low-priority jobs. It shows up as `oldest_pending_seconds` climbing while throughput stays healthy. Writing the age into the `ORDER BY` would cost the claim index — measured, and compared against the three approaches that do not, in [`specs/04`](specs/04-claiming.md) §4.
 - **No authentication.** Anyone who can reach the API can read any job whose id they know. Random UUIDs are obscurity, not authorization.
 - **SSRF protection is incomplete by construction.** A hostname that resolves publicly at submission can resolve inward by execution time; closing that gap requires pinning the resolved address in the HTTP client at request time.
 - **No retention policy**, so terminal jobs — and their idempotency keys — accumulate without bound. Keeping the keys is deliberate; keeping every row forever is the price, and a policy is future work with constraints already recorded in [`specs/01`](specs/01-data-model.md) §8.
