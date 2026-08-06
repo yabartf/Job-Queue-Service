@@ -377,7 +377,77 @@ Note: `http://intranet` is blocked because a single-label name resolves through 
 
 ---
 
-## 14 · Final snapshot
+## 14 · A burst, and what `/health` says during one
+
+Everything above submits jobs one at a time. This submits sixty back to back and watches the queue absorb them — the only section that produces numbers rather than states.
+
+```bash
+for n in $(seq 1 60); do
+  sub "{\"job_type\":\"email\",\"priority\":$((RANDOM % 10)),\"payload\":{\"to\":\"burst$n@example.com\",\"subject\":\"burst $n\",\"body\":\"scale check\"}}" > /dev/null
+done
+```
+
+Then, in a second shell, while it drains:
+
+```bash
+while true; do
+  curl -sS -o /dev/null -w '%{http_code} %{time_total}s  ' localhost:8000/health
+  curl -sS localhost:8000/health | python -c "import sys,json;q=json.load(sys.stdin);print(q['queue']['pending'],'pending |',q['queue']['processing'],'processing |',q['queue']['ready_hints'],'hints |',(q['workers'] or {}).get('count'),'workers')"
+  sleep 2
+done
+```
+
+**Expect**, measured on the stack this was written against:
+
+| | |
+|---|---|
+| Submission | 60 × `201` in about 4 s — ~16 req/s, median 62 ms |
+| `/health` during the burst | **every response 200**, median ~14 ms, `workers` never anything but 4 |
+| `processing` | pinned at **exactly 4** for the whole drain — two processes × two slots, saturated |
+| Drain | ~30 s, ~2.0 jobs/s |
+
+That throughput is the point. Four slots divided by the email handler's ~2.08 s mean sleep is 1.92 jobs/s, so a measured 2.0 means the queue is adding **no overhead of its own** — the bottleneck is the simulated work, exactly where it should be.
+
+Then confirm nothing ran twice:
+
+```bash
+psql "SELECT count(*), min(attempts), max(attempts),
+             count(*) FILTER (WHERE status <> 'completed') AS not_completed,
+             count(*) FILTER (WHERE worker_id IS NOT NULL OR lease_until IS NOT NULL) AS stuck
+      FROM jobs WHERE payload->>'subject' LIKE 'burst%';"
+```
+
+**Expect:** 60 rows, `min` and `max` of `attempts` both **1**, and zeros in the last two columns. `attempts = 1` everywhere is the assertion — a second execution of any job would show as 2.
+
+```bash
+psql "SELECT meta->>'worker_id' AS worker, count(*) AS claims,
+             count(*) FILTER (WHERE (meta->>'from_hint')::bool) AS from_hint
+      FROM job_logs WHERE message LIKE 'Claimed by%' GROUP BY 1 ORDER BY 1;"
+```
+
+**Expect:** the sixty claims spread roughly evenly across all four workers — and **only a handful marked `from_hint`**.
+
+That last number looks wrong and is not. A slot consults Redis only when its own claim came back empty, so the few hints consumed are the ones popped in the first moment, before a backlog existed; after that every claim comes from the PostgreSQL fallback. It is also why `ready_hints` sits at roughly sixty for the whole drain while `pending` falls to zero, and then drops to zero at the end as the idle slots pop the stale entries out. **Both numbers are correct; only a symmetric reading of the gap is wrong** (§15).
+
+### Priority, under real concurrency
+
+```bash
+psql "WITH claims AS (
+        SELECT j.priority, row_number() OVER (ORDER BY l.created_at, l.id) AS n
+        FROM job_logs l JOIN jobs j ON j.id = l.job_id
+        WHERE l.message LIKE 'Claimed by%' AND j.payload->>'subject' LIKE 'burst%')
+      SELECT (n - 1) / 20 AS third, round(avg(priority), 2) FROM claims GROUP BY 1 ORDER BY 1;"
+```
+
+**Expect** the average priority to fall across the three groups — about 7.5, then 5.0, then 0.8.
+
+The first few claims will include low priorities, and that is not a defect: pickup latency is around 30 ms, so the first jobs were claimed while only two or three existed. **A priority queue orders what has arrived.** From the moment a real backlog exists — a second or so in — every claim is a 9.
+
+- [ ] passed
+
+---
+
+## 15 · Final snapshot
 
 ```bash
 curl -sS localhost:8000/health | python -m json.tool
@@ -388,7 +458,7 @@ curl -sS localhost:8000/health | python -m json.tool
 | Field | What it tells you |
 |---|---|
 | `queue.pending` + `oldest_pending_seconds` | Depth alone cannot separate load from failure. High depth with low age = a busy system keeping up. Low depth with high age = a stuck one. |
-| `queue.ready_hints` | Should track `pending`. A large gap means announcements are failing and everything is arriving through the fallback. |
+| `queue.ready_hints` | Read against `pending` **directionally**. Below it: announcements are failing. Above it: ordinary while a backlog drains (§14). High while `pending` is 0: a dispatch nothing is reading — that is the fault. |
 | `queue.dead_lettered` | Should be 0. If it is not, there is work no retry can help. |
 | `workers.count` | 4 in a normal run. `null` means no visibility into Redis. |
 
@@ -421,8 +491,8 @@ docker compose restart worker
 
 | | |
 |---|---|
-| **Exactly-once pickup under concurrency** | Needs ten workers competing for the same row in the same millisecond. That cannot be timed by hand — `tests/integration/test_claiming.py` and `tests/load/` do it with real connections and real commits, including through the Redis dispatch path. |
+| **Exactly-once pickup under concurrency** | §14 gets close — sixty jobs through four concurrent slots with every row ending at `attempts = 1` — but it cannot force ten workers onto the *same row in the same millisecond*, which is where the guarantee is actually decided. `tests/integration/test_claiming.py` and `tests/load/` do that, with real connections and real commits, including through the Redis dispatch path. |
 | **A displaced worker writing a stale result** | Needs a worker frozen precisely between lease expiry and its write. That is `test_w2_07`. |
 | **Exact attempt exhaustion** | Depends on the 20 % coin flip; in the suite it is deterministic with an injected RNG. |
 
-What it does do: all fourteen sections above fail if any of those mechanisms is broken. They do not prove the mechanism — they rule it out.
+What it does do: all fifteen sections above fail if any of those mechanisms is broken. They do not prove the mechanism — they rule it out.

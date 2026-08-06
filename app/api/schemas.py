@@ -105,9 +105,14 @@ class QueueDepth(BaseModel):
     #: depth and low age is a busy system keeping up, low depth and high age is
     #: a stuck one. None when nothing is waiting.
     oldest_pending_seconds: float | None = None
-    #: Size of the Redis dispatch set. Should track `pending`; a large gap means
-    #: announcements are failing and everything is arriving via the fallback.
-    #: None when Redis cannot answer.
+    #: Size of the Redis dispatch set. Compare it to `pending` *directionally*:
+    #: below means announcements are failing and work is arriving through the
+    #: slower fallback, while above is ordinary while a backlog drains — a slot
+    #: consults the dispatch only when its own scan came back empty, so a busy
+    #: queue stops the set being consumed and the surplus is stale entries that
+    #: clean themselves once the workers are idle again. The fault worth
+    #: alerting on is this staying high while `pending` is zero: a dispatch
+    #: nothing is reading. None when Redis cannot answer.
     ready_hints: int | None = None
     #: Failures that cannot be retried. Should be zero; worth alerting on.
     dead_lettered: int = 0
