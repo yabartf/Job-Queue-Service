@@ -48,6 +48,8 @@ A suite that passed against SQLite would be asserting nothing about the mechanis
 
 `pytest --cov=app --cov-report=term-missing` — the command the README gives. `--cov-fail-under=90` is the floor to add in CI; the suite has stayed above it since part 1.
 
+There is no CI pipeline: the suite is a local gate, run before submission. Any pipeline added later needs a PostgreSQL service container **even to run L1 alone** — `migrated_database` in `tests/conftest.py` is session-scoped and autouse, so it brings the schema to head before any test at any level, and the unit tests are pure only in what they exercise, not in what the session costs to start.
+
 Excluded: `app/migrations/` only — hand-written Alembic revisions, exercised by L2-17 rather than measured. The worker's entry point is **not** excluded: it is what builds the real dispatch, and excluding it is exactly how a worker wired to `NullDispatch` passed a green suite once already. Current: **100 %**.
 
 ⚠️ Coverage is configured with `concurrency = ["thread", "greenlet"]`. SQLAlchemy's asyncio layer runs its synchronous core inside greenlets; without this setting the tracer is lost across a greenlet switch and every line *after* an `await session.execute(...)` is reported as unreached. The symptom is a plausible-looking 96 % that hides nothing real — worth knowing, because the natural reaction is to write tests for code that was already covered.

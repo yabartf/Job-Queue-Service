@@ -288,7 +288,7 @@ async def test_run_forever_drains_without_waiting_between_jobs():
             await asyncio.sleep(0)
         stop.set()
 
-    await asyncio.gather(slot.run_forever(stop), stop_once_drained())
+    await asyncio.wait_for(asyncio.gather(slot.run_forever(stop), stop_once_drained()), timeout=5)
 
     assert len(service.completed) == 3
 

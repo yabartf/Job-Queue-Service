@@ -123,8 +123,15 @@ async def test_w4_02_a_worker_dying_mid_run_costs_only_time(pooled_sessions, clo
     victim = build_worker(pooled_sessions, clock)
     stop = asyncio.Event()
     task = asyncio.create_task(victim.run(stop))
-    while await count_where(pooled_sessions, "status = 'completed'") < 5:
-        await asyncio.sleep(0.01)
+
+    async def until_it_has_done_some_work() -> None:
+        while await count_where(pooled_sessions, "status = 'completed'") < 5:
+            await asyncio.sleep(0.01)
+
+    # Bounded like every other wait here: a worker that never gets going is the
+    # defect this test exists to notice, and an unbounded loop answers it by
+    # hanging the suite rather than by failing it.
+    await asyncio.wait_for(until_it_has_done_some_work(), timeout=60.0)
 
     task.cancel()  # no graceful path: leases are simply abandoned
     await asyncio.gather(task, return_exceptions=True)
