@@ -16,7 +16,7 @@ services:
       retries: 20
 
   # Separate database for the test suite. Tests need a real PostgreSQL (JSONB,
-  # partial unique indexes, and SKIP LOCKED in spec 10 have no SQLite
+  # partial unique indexes, and SKIP LOCKED in spec 04 have no SQLite
   # equivalent), but must never touch development data. tmpfs: throwaway and fast.
   db-test:
     image: postgres:16-alpine

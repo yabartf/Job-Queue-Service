@@ -1,7 +1,7 @@
 ﻿# Test Plan
 
 **Status:** Accepted — implemented
-**Covers:** specs 01–02 (part 1, §6–§8), specs 03–08 (part 2, §9), spec 09 (part 3, `tests/integration/test_hardening.py`) and spec 10 (§12). 488 tests, 100 % coverage.
+**Covers:** specs 01–02 (part 1, §6–§8), specs 03–08 (part 2, §9), spec 09 (part 3, `tests/integration/test_hardening.py`) and spec 10 (§12). 493 tests, 100 % coverage.
 
 ## 1. Principles
 
@@ -36,19 +36,19 @@ A suite that passed against SQLite would be asserting nothing about the mechanis
 
 **Dispatch** — the worker suite runs against `NullDispatch`. That is not a shortcut: it means the Postgres fallback claim, which is the path that actually guarantees correctness, is the one under test, and the suite needs no Redis to be meaningful.
 
-**Loops** — the slot exposes `run_once()`. Tests drive it a step at a time rather than starting `run_forever` and waiting for something to happen; no worker test contains a sleep.
+**Loops** — the slot exposes `run_once()`, and tests drive it a step at a time rather than starting `run_forever` and waiting for something to happen. Two tests of the loop itself cannot: W1-15b asserts a *rate*, which only exists over elapsed time, and it uses a 50 ms interval so the wait is bounded and the assertion is a range rather than an exact count. Every other loop test ends the loop from inside a fake — W1-15c sets the stop event from within the failing claim — so nothing waits on a timer.
 
 **Database isolation** — each test runs inside a transaction rolled back on teardown.
 
 **Connection pooling** — the concurrency fixtures use `NullPool` so each session is unmistakably its own connection. The *load* tests use a pooled fixture instead: a worker opens a short unit of work per operation, so draining a backlog means thousands of them, and with `NullPool` each one is a fresh TCP connection and authentication. The first version of the load test took twenty minutes and timed out; pooled, the same test takes three seconds. It was measuring the fixture.
 
-⚠️ **Exception:** the concurrent-idempotency tests (L2-14, E2E-12) need genuinely separate connections and therefore cannot share a rolled-back transaction. They commit and clean up explicitly by truncating. This is called out because reusing the standard fixture there would make the test silently meaningless — it would serialise the very concurrency it exists to exercise.
+⚠️ **Exception:** every concurrency test needs genuinely separate connections and therefore cannot share a rolled-back transaction — the concurrent-idempotency ones (L2-14, E2E-12), the claiming and cancellation races (W2-03, W2-04, W2-07, W2-19) on `committing_sessions`, and the load tests on `pooled_sessions`. They commit and clean up explicitly by truncating. This is called out because reusing the standard fixture there would make the test silently meaningless — it would serialise the very concurrency it exists to exercise.
 
 ## 5. Coverage
 
-`pytest --cov=app --cov-report=term-missing --cov-fail-under=90`
+`pytest --cov=app --cov-report=term-missing` — the command the README gives. `--cov-fail-under=90` is the floor to add in CI; the suite has stayed above it since part 1.
 
-Excluded: `app/migrations/`, `__main__` entry points. Current: **100 %**.
+Excluded: `app/migrations/` only — hand-written Alembic revisions, exercised by L2-17 rather than measured. The worker's entry point is **not** excluded: it is what builds the real dispatch, and excluding it is exactly how a worker wired to `NullDispatch` passed a green suite once already. Current: **100 %**.
 
 ⚠️ Coverage is configured with `concurrency = ["thread", "greenlet"]`. SQLAlchemy's asyncio layer runs its synchronous core inside greenlets; without this setting the tracer is lost across a greenlet switch and every line *after* an `await session.execute(...)` is reported as unreached. The symptom is a plausible-looking 96 % that hides nothing real — worth knowing, because the natural reaction is to write tests for code that was already covered.
 
@@ -200,6 +200,8 @@ Specs 03–08. The whole worker suite runs against `NullDispatch`, so the Postgr
 | W1-14 | dispatch read timeout | the client's socket budget exceeds the longest block it will carry, so an idle poll cannot be mistaken for a Redis failure |
 | W1-14c | dispatch fails while the caller asked to block | the failure still costs the block — the remainder of it, not the whole timeout again — while the non-blocking form returns at once |
 | W1-15 | slot: a cycle raises | the loop reports, waits one interval, and goes on claiming — it does not end the slot |
+| W1-15b | slot: every cycle raises | roughly one attempt per interval, not thousands — an outage must not become a hot loop against the dependency that is already down |
+| W1-15c | slot: a shutdown lands during that wait | the loop ends there, rather than waiting the interval out and running one more cycle |
 
 ### W2 — integration, real PostgreSQL
 

@@ -61,7 +61,7 @@ class Job(Base):
 
     scheduled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
-    # Written by the worker from spec 10 onward. Created here so the schema is
+    # Written by the worker from spec 04 onward. Created here so the schema is
     # migrated once rather than altered under code that already depends on it.
     worker_id: Mapped[str | None] = mapped_column(Text)
     lease_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -124,7 +124,7 @@ class Job(Base):
             unique=True,
             postgresql_where=text("idempotency_key IS NOT NULL"),
         ),
-        # Claim path (spec 10). Partial: terminal rows are the majority over
+        # Claim path (spec 04). Partial: terminal rows are the majority over
         # time, and excluding them keeps the hot index small enough to stay cached.
         Index(
             "ix_jobs_claim",

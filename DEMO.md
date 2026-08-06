@@ -2,7 +2,7 @@
 
 One path, end to end, against the running system. About 20 minutes.
 
-This is not a replacement for `specs/TEST_PLAN.md` (488 automated tests) — it is what you run by hand before submitting, or in an interview when someone says "show me it works".
+This is not a replacement for `specs/TEST_PLAN.md` (493 automated tests) — it is what you run by hand before submitting, or in an interview when someone says "show me it works".
 
 **Shell:** bash. **Prerequisite:** `docker compose up --build` is running.
 

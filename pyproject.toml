@@ -43,7 +43,10 @@ markers = [
 
 [tool.coverage.run]
 source = ["app"]
-omit = ["app/migrations/*", "app/__main__.py"]
+# Hand-written Alembic revisions, exercised by an upgrade/downgrade test rather
+# than measured. Nothing else is omitted — least of all the worker entry point,
+# which is the module that builds the real dispatch.
+omit = ["app/migrations/*"]
 # SQLAlchemy's asyncio layer runs its synchronous core inside greenlets. Without
 # this, coverage loses the tracer across a greenlet switch and reports the lines
 # after every `await session.execute(...)` as unreached.

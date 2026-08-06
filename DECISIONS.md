@@ -11,7 +11,7 @@ Some decisions are settled but not yet built. Rather than leave those sections e
 | 3 | Manual retry endpoint, dead-letter routing, job timeout enforcement | **Implemented** |
 | 4 | Job history over HTTP — the audit trail written since part 1 | **Implemented** |
 
-488 tests, 100 % line coverage. Verified end to end against the real stack: a submitted job runs to completion, the system keeps processing with Redis stopped, and `SIGKILL` on both workers strands four jobs which the reaper returns and another worker finishes — with no intervention.
+493 tests, 100 % line coverage. Verified end to end against the real stack: a submitted job runs to completion, the system keeps processing with Redis stopped, and `SIGKILL` on both workers strands four jobs which the reaper returns and another worker finishes — with no intervention.
 
 ---
 
@@ -181,14 +181,16 @@ The split also protects the hot path. Had the claim query used `status IN ('pend
 
 **Timing:**
 
-| Attempt | Delay before it runs |
-|---|---|
-| 1 | immediate |
-| 2 | 30 seconds |
-| 3 | 2 minutes |
-| after 3 | `FAILED`, permanently |
+| Attempt | Nominal delay | Actual wait, with jitter |
+|---|---|---|
+| 1 | immediate | immediate |
+| 2 | 30 seconds | **15–30 s** |
+| 3 | 2 minutes | **60–120 s** |
+| after 3 | — | `FAILED`, permanently |
 
-**Jitter: equal, not full.** The actual wait is `delay/2 + uniform(0, delay/2)` — 15–30 s before attempt 2, 60–120 s before attempt 3.
+The third column is what a stopwatch measures, and it is the column to read: no retry in this system waits exactly 30 seconds, by design.
+
+**Jitter: equal, not full.** The wait is `delay/2 + uniform(0, delay/2)`, so it lands in the upper half of the nominal delay rather than anywhere below it.
 
 Jitter is not decoration. A downstream outage fails every in-flight job at roughly the same moment; without it, all of them retry at the same instant and again 90 seconds later, and the retry storm becomes a self-inflicted load spike on a service that is already unhealthy. Worse, the synchronisation persists across every subsequent round.
 

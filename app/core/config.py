@@ -22,8 +22,8 @@ class Settings(BaseSettings):
     worker_concurrency: int = 2
     #: How long a claim holds a job before the reaper may take it back.
     worker_lease_seconds: int = 60
-    #: Lease extension interval. Must stay well below a third of the lease, so a
-    #: single missed extension does not expire it.
+    #: Lease extension interval — a third of the lease, so a single missed
+    #: extension still leaves a further one before it could expire.
     worker_heartbeat_seconds: int = 20
     #: Blocking wait when the queue is empty — not a poll interval in the hot path.
     worker_poll_interval_seconds: float = 5.0
