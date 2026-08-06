@@ -238,7 +238,7 @@ RETURNING *;
 **Decisions:**
 
 - **Scope is global, not per job type.** The assignment states "same idempotency key → return the existing job" without qualification. A per-type scope would let one key produce four different jobs, which is a surprising reading.
-- **Retention ≥ 24h** is satisfied because the key lives on the job row and rows are not deleted. Key expiry only becomes a separate concern alongside a job-retention policy, which is out of scope and recorded in DECISIONS.md §5.
+- **Keys are retained for the life of the job row, which is unbounded — and that is a decision, not an omission.** The requirement is a floor ("at least 24 hours"), not a window, so the safe direction to miss it in is upwards. Expiring a key means a client that retries a submission after the window gets a *second job* instead of the original, silently, and a duplicate charge or a duplicate email is a worse failure than a large table. Nothing in the system expires a key, and nothing should without the design work in §8. `L2-22` pins the floor by ageing a key past 25 hours and asserting the replay still matches — so the day a retention policy takes the key with it, a test fails rather than a client double-pays.
 - **Same key, different payload → return the existing job**, as instructed, and emit a `warning` log plus a `job_logs` entry. Returning 409 would arguably serve the client better by surfacing their bug, but it contradicts the stated requirement; the alternative is recorded rather than silently chosen.
 
 ## 7. Migrations
@@ -249,7 +249,21 @@ The migration is verified by a test that runs `upgrade head` then `downgrade bas
 
 ## 8. Deferred
 
-- Retention/archival of terminal jobs. The partial indexes keep the hot paths fast as the table grows, but the table itself grows without bound.
+### Retention — known, unsolved, and needing its own spec
+
+The partial indexes keep the hot paths fast as terminal rows accumulate, but **nothing removes them**: the `jobs` table, its `job_logs` children and every idempotency key ever submitted grow without bound. On a real deployment this eventually needs a policy, and this project does not have one. It is the largest thing knowingly left unbuilt in the data model.
+
+It is deferred rather than added because retention is not a sweep — it is a set of product decisions this project has no basis to make (how long is a completed job interesting? is an audit trail a compliance artefact?), and getting it wrong deletes data. What follows is not a plan; it is the set of constraints any future implementation inherits, recorded now while the reasons are fresh:
+
+1. **A 24-hour floor, enforced in configuration rather than documented.** The retention window is the idempotency window (§6), so a value below 24 hours breaks a stated requirement of the system. It must be impossible to configure, not merely discouraged.
+2. **The submit path stops being safe.** `JobService.submit` reads the existing row after `ON CONFLICT DO NOTHING` returns nothing, and its `if existing is None` branch is currently unreachable — marked `pragma: no cover` — precisely because rows are never deleted. Under any expiry it becomes reachable: the insert conflicts, the sweep commits, the read finds nothing, and a valid submission fails. The fix is to retry the insert once, since a key that has just disappeared is a key the insert is now entitled to take. Whoever adds retention owns that branch and a test for it.
+3. **`failed` is not terminal here.** `TERMINAL_STATUSES` deliberately excludes it, because a failed job can be manually retried (spec 09 §2). Expiring the key of a failed job leaves one key describing two jobs, one of which is still re-armable.
+4. **Deleting a job deletes its history.** `job_logs` cascades. `GET /jobs/{id}/logs` is the answer to "why is this job in the state it is in" (spec 10), so a retention policy is also a decision to stop being able to answer that question after N days.
+
+Until that spec exists, the property in §6 holds and is tested. The limitation is recorded here, in `DECISIONS.md` §5, and in the README's known limitations, so that it is found rather than discovered.
+
+### Smaller
+
 - Payload-field indexing (e.g. GIN on `payload`). Nothing needs it yet.
 - Keyset pagination for listing. Offset pagination is specified in spec 02; the switch is mechanical if listings grow.
 

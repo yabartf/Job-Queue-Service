@@ -69,7 +69,7 @@ Every requirement in the assignment, with the code that satisfies it and the tes
 | Payload validation as a security boundary | per-type Pydantic schemas, SSRF rules, body size cap | `L1-20…26b`, `E2E-07`, `E2E-08` |
 | Request correlation | `X-Request-ID` on every response and log line | `E2E-25` |
 
-Two requirements are met by a property rather than by code, so they are stated rather than linked. **Idempotency keys are retained for at least 24 hours** because nothing ever expires them — there is no TTL and no retention sweep, which `L2-22` pins against the day one is added. **No polling hot-loop**: an idle slot blocks in Redis `BZPOPMIN` rather than spinning, and a busy one never waits at all.
+Two requirements are met by a property rather than by code, so they are stated rather than linked. **Idempotency keys are retained for at least 24 hours** because nothing expires them, and that is chosen rather than merely true: the requirement is a floor, and expiring a key would mean a client retrying its submission later quietly gets a *second job* instead of the original. `L2-22` ages a key past 25 hours and asserts the replay still matches, so the day a retention policy takes the key with it, a test fails first. The cost — a table that grows without bound — is real, unsolved, and needs its own design work; the constraints it inherits are written out in [`specs/01`](specs/01-data-model.md) §8. **No polling hot-loop**: an idle slot blocks in Redis `BZPOPMIN` rather than spinning, and a busy one never waits at all.
 
 ## Submitting a test job
 
@@ -446,4 +446,4 @@ Stated deliberately; the reasoning for each is in [`DECISIONS.md`](DECISIONS.md)
 - **No aging**, so a sustained stream of high-priority work can starve low-priority jobs.
 - **No authentication.** Anyone who can reach the API can read any job whose id they know. Random UUIDs are obscurity, not authorization.
 - **SSRF protection is incomplete by construction.** A hostname that resolves publicly at submission can resolve inward by execution time; closing that gap requires pinning the resolved address in the HTTP client at request time.
-- **No retention policy**, so terminal jobs — and their idempotency keys — accumulate without bound.
+- **No retention policy**, so terminal jobs — and their idempotency keys — accumulate without bound. Keeping the keys is deliberate; keeping every row forever is the price, and a policy is future work with constraints already recorded in [`specs/01`](specs/01-data-model.md) §8.
